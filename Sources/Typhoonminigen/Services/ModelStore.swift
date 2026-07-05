@@ -3,13 +3,19 @@ import CryptoKit
 import Flux2Core
 import FluxTextEncoders
 
-/// An auxiliary on-disk model component (encoder / VAE / VLM). "Delete model" only reclaims
-/// the transformer — these rows make the other ~11 GB visible and manageable (audit finding).
+/// An auxiliary on-disk model component that doesn't belong to a generation tier group
+/// (the shared VAE and the Describe VLM). The tier-group encoders are listed inside their
+/// groups now; these two are shown in the "Shared components" section.
 struct AuxComponent: Identifiable, Sendable {
     let id: String       // relative path under the app's Models dir
     let title: String
     let note: String     // role + what happens after delete
-    let bytes: Int64
+    let bytes: Int64     // on-disk size (0 when not downloaded)
+    let isDownloaded: Bool
+    let sizeGB: Int      // estimated download size — shown before download + used for the disk preflight
+    let downloadable: Bool  // true → the Models tab can pre-download it (the Describe / Auto-caption VLM)
+    let recommended: Bool   // the default pick (the 4-bit VLM) — gets a "Recommended" badge
+    let isActive: Bool      // this downloaded VLM is the one Describe / Auto-caption currently use
 }
 
 enum ModelStoreError: LocalizedError {
@@ -26,48 +32,75 @@ enum ModelStoreError: LocalizedError {
     }
 }
 
-/// Wraps the engine's model downloader for the Klein transformers:
-/// list state + size, download (with progress + integrity pin + encoder), delete to reclaim space.
+/// Wraps the engine's downloaders for every Klein component the Models tab manages:
+/// per-variant download (with progress + integrity pin), status, on-disk size and delete.
 actor ModelStore {
-    /// Everything the engine stores next to the transformer. All re-download automatically
-    /// and tokenlessly when next needed, so deleting any of them is safe — just costs a
-    /// re-download.
-    private static let auxDefs: [(rel: String, title: String, note: String)] = [
-        ("lmstudio-community/Qwen3-8B-MLX-8bit",
-         "Qwen3-8B text encoder (Klein 9B)",
-         "Required for every Klein 9B generation. Re-downloads automatically (~8 GB, no token)."),
-        ("lmstudio-community/Qwen3-4B-MLX-8bit",
-         "Qwen3-4B text encoder (Klein 4B)",
-         "Required for every Klein 4B generation. Re-downloads automatically (~4 GB, no token)."),
-        // The engine silently PREFERS an existing 4-bit Qwen3-4B over fetching the 8-bit —
-        // list it so the disk accounting never hides a ~2 GB directory.
-        ("lmstudio-community/Qwen3-4B-MLX-4bit",
-         "Qwen3-4B text encoder · 4-bit (Klein 4B)",
-         "Lighter encoder variant — when present, Klein 4B uses it instead of the 8-bit one."),
+    // MARK: Shared (non-tier) components — VAE + Describe VLM
+
+    /// Components that aren't part of an Image-Generation tier group. The tier encoders moved
+    /// into their groups; the shared VAE (decodes for BOTH tiers — never auto-delete it) and the
+    /// Describe VLM live here. All re-download automatically when next needed.
+    private static let auxDefs: [(rel: String, title: String, note: String, sizeGB: Int, downloadable: Bool, alwaysShow: Bool, recommended: Bool)] = [
         ("black-forest-labs/FLUX.2-klein-4B-vae",
          "Shared VAE (latents → pixels)",
-         "Required for every generation — BOTH Klein tiers decode through it (the \u{201C}klein-4B\u{201D} name is just the repo BFL hosts it in). Re-downloads automatically (~160 MB, no token)."),
+         "Required for every generation — BOTH Klein tiers decode through it (the \u{201C}klein-4B\u{201D} name is just the repo BFL hosts it in). Re-downloads automatically (~160 MB, no token).",
+         1, false, false, false),
         ("mlx-community/Qwen3.5-4B-MLX-4bit",
-         "Qwen3.5-VLM (Describe with AI)",
-         "Only needed for Describe. Re-downloads on next use (~3 GB, no token)."),
+         "Qwen3.5-VLM 4B (4-bit) · Describe & Auto-caption",
+         "The vision model that reads an image and writes a description. Used by Describe (Generate) and Auto-caption (LoRA Training) — it is NOT the Qwen3 text encoder. ~3 GB, no token. The lighter, recommended choice; auto-downloads on first use if neither variant is present.",
+         3, true, true, true),
+        ("mlx-community/Qwen3.5-4B-MLX-8bit",
+         "Qwen3.5-VLM 4B (8-bit) · higher quality",
+         "The SAME vision model, less compressed — slightly sharper, more detailed captions for ~5 GB and a bit more RAM. Optional: download it and captioning/Describe use it automatically instead of the 4-bit. Independent of the 4B/9B training tier.",
+         5, true, true, false),
     ]
 
-    /// The components currently present on disk, with real sizes.
+    /// The Qwen3.5-VLM variant a shared-component row maps to (matched by HuggingFace repo id),
+    /// or nil for the VAE.
+    private static func qwen35Variant(forRel rel: String) -> Qwen35Variant? {
+        Qwen35Variant.allCases.first { $0.repoId == rel }
+    }
+
+    /// The shared components. Both VLM quantizations are ALWAYS listed (downloaded or not) so they can
+    /// be seen and pre-downloaded before first use; the VAE only appears once present (auto-ships with Klein).
     func auxComponents() -> [AuxComponent] {
-        // Dangling symlink-imports (original moved/unmounted) must not list as installed.
         ModelImportService.sweepDanglingLinks(under: AppPaths.models)
+        let activeRepo = DescribeService.variant.repoId   // which VLM Describe/Auto-caption use right now
         return Self.auxDefs.compactMap { def in
             let url = AppPaths.models.appendingPathComponent(def.rel, isDirectory: true)
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            let present = FileManager.default.fileExists(atPath: url.path)
+            guard present || def.alwaysShow else { return nil }
+            // A VLM row uses the engine's completeness check (a half-finished download must read as
+            // "not downloaded" so the row offers Download/resume, not a false "on disk").
+            let downloaded = Self.qwen35Variant(forRel: def.rel)
+                .map { TextEncoderModelDownloader.isQwen35ModelDownloaded(variant: $0) } ?? present
             return AuxComponent(id: def.rel, title: def.title, note: def.note,
-                                bytes: Self.directorySize(url))
+                                bytes: present ? Self.directorySize(url) : 0,
+                                isDownloaded: downloaded, sizeGB: def.sizeGB,
+                                downloadable: def.downloadable, recommended: def.recommended,
+                                isActive: def.downloadable && downloaded && def.rel == activeRepo)
         }
     }
 
-    /// Delete one auxiliary component. Returns bytes reclaimed, or nil when the target was
-    /// a symlink-import — removing the link frees ~nothing, so no freed-bytes figure.
+    /// Make a downloaded VLM the active one for Describe / Auto-caption (the "Use" action).
+    func setActiveVLM(id: String) {
+        guard let v = Self.qwen35Variant(forRel: id) else { return }
+        DescribeService.setPreferred(v)
+    }
+
+    /// Pre-download a shared VLM component (4-bit or 8-bit) — the exact same fetch its first use would
+    /// trigger, just initiated deliberately from the Models tab.
+    func downloadAux(id: String, progress: @escaping @Sendable (Double, String) -> Void) async throws {
+        guard let v = Self.qwen35Variant(forRel: id) else { return }
+        progress(0, "Preparing…")
+        _ = try await TextEncoderModelDownloader().downloadQwen35(variant: v) { p, _ in
+            progress(p, p < 1 ? "Downloading Qwen3.5-VLM… \(Int(p * 100))%" : "Finishing…")
+        }
+    }
+
+    /// Delete one shared component. Returns bytes reclaimed, or nil when the target was a
+    /// symlink-import — removing the link frees ~nothing, so no freed-bytes figure.
     func deleteAux(_ id: String) throws -> Int64? {
-        // Only known component paths — never an arbitrary rm inside Models/.
         guard Self.auxDefs.contains(where: { $0.rel == id }) else { return 0 }
         let url = AppPaths.models.appendingPathComponent(id, isDirectory: true)
         if Self.isSymlink(url) {
@@ -79,71 +112,155 @@ actor ModelStore {
         return size
     }
 
-    func catalog() -> [ModelInfo] {
-        // Dangling symlink-imports (original moved/unmounted) must not list as installed.
+    // MARK: Group catalog (component-level, with live status)
+
+    /// Build the live `ModelGroupInfo` list for a set of specs (Image Generation / LoRA Training).
+    func groups(_ specs: [ModelGroupSpec]) -> [ModelGroupInfo] {
         ModelImportService.sweepDanglingLinks(under: AppPaths.models)
-        return ModelTier.allCases.map { tier in
-            let comp = ModelRegistry.ModelComponent.transformer(tier.transformerVariant)
-            let downloaded = Flux2ModelDownloader.isDownloaded(comp)
-            return ModelInfo(
-                id: tier.rawValue,
-                tier: tier,
-                title: tier.displayName,
-                estimatedSizeGB: tier.transformerVariant.estimatedSizeGB,
-                isGated: tier.transformerVariant.isGated,
-                isDownloaded: downloaded,
-                isEncoderDownloaded: tier.isEncoderDownloaded,
-                downloadedBytes: downloaded ? sizeOf(comp) : 0,
-                license: tier.license
+        return specs.map { s in
+            ModelGroupInfo(
+                id: s.id, title: s.title, subtitle: s.subtitle, ramBadge: s.ramBadge,
+                nonCommercial: s.nonCommercial, encoderHeader: s.encoderHeader,
+                transformers: s.transformers.map { info(.transformer($0)) },
+                encoders: s.encoders.map { info(.encoder($0)) }
             )
         }
     }
 
+    private func info(_ kind: ComponentKind) -> ComponentInfo {
+        switch kind {
+        case .transformer(let v):
+            let comp = ModelRegistry.ModelComponent.transformer(v)
+            let dl = Flux2ModelDownloader.isDownloaded(comp)
+            return ComponentInfo(
+                id: "tf-\(v.rawValue)", kind: kind, title: ModelCatalog.title(for: v),
+                rawTag: v.rawValue, sizeGB: v.estimatedSizeGB, isGated: v.isGated,
+                repoURL: v.huggingFaceURL, isDownloaded: dl,
+                downloadedBytes: dl ? Self.transformerBytes(v) : 0)
+        case .encoder(let v):
+            let dl = Self.encoderDownloaded(v)
+            return ComponentInfo(
+                id: "enc-\(v.rawValue)", kind: kind, title: v.displayName,
+                rawTag: v.rawValue, sizeGB: v.estimatedSizeGB, isGated: false,
+                repoURL: v.huggingFaceURL, isDownloaded: dl,
+                downloadedBytes: dl ? Self.directorySize(AppPaths.models.appendingPathComponent(v.repoId, isDirectory: true)) : 0)
+        }
+    }
+
+    // MARK: Partial downloads (cancelled/interrupted residue)
+
+    /// The dir a component downloads into — where its `.part` streams + `.chunks` sidecars
+    /// live. MUST mirror `download(kind:)` exactly, or the partial-bytes report and the
+    /// "Delete partial" action would look at the wrong place.
+    private static func destDir(_ kind: ComponentKind) -> URL {
+        switch kind {
+        case .transformer(let v):
+            return ModelRegistry.localPath(for: .transformer(v))
+        case .encoder(let v):
+            return AppPaths.models.appendingPathComponent(v.repoId, isDirectory: true)
+        }
+    }
+
+    /// id → on-disk bytes of every NOT-downloaded component in `groups`. A cancelled multi-GB
+    /// download keeps its `.part` files for resume, but the row used to report 0 bytes and
+    /// offer no Delete — the space was invisible AND unreclaimable. Everything in the dir
+    /// counts (finished files, `.part`, sidecars): until the component reads as downloaded,
+    /// the whole dir is resume residue. Symlink imports report nothing — a "Delete partial"
+    /// must never be able to touch a user's original files.
+    func partialSizes(for groups: [ModelGroupInfo]) -> [String: Int64] {
+        let fm = FileManager.default
+        var out: [String: Int64] = [:]
+        for comp in groups.flatMap(\.allComponents) where !comp.isDownloaded {
+            let dir = Self.destDir(comp.kind)
+            guard fm.fileExists(atPath: dir.path), !Self.isSymlink(dir) else { continue }
+            let size = Self.directorySize(dir)
+            if size > 0 { out[comp.id] = size }
+        }
+        return out
+    }
+
+    /// Delete a NOT-downloaded component's partial residue. Returns bytes reclaimed; throws so
+    /// the UI can report a real failure. The caller guards against a download currently running
+    /// for this id (deleting the dir under an active writer would corrupt the stream).
+    func deletePartial(kind: ComponentKind) throws -> Int64 {
+        let dir = Self.destDir(kind)
+        guard FileManager.default.fileExists(atPath: dir.path), !Self.isSymlink(dir) else { return 0 }
+        let size = Self.directorySize(dir)
+        try FileManager.default.removeItem(at: dir)
+        return size
+    }
+
+    // MARK: Download / delete (per component)
+
     func download(
-        tier: ModelTier,
+        kind: ComponentKind,
         hfToken: String?,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws {
-        let downloader = Flux2ModelDownloader(hfToken: hfToken)
-        let comp = ModelRegistry.ModelComponent.transformer(tier.transformerVariant)
-        // NB 4B is one 3.9 GB safetensors and engine progress is per-file — the bar sits
-        // still for most of the transfer; ModelRow shows a persistent caption for that.
-        _ = try await downloader.download(comp, progress: onProgress)
+        // Route through our resumable downloader (HTTP Range → .part), NOT the engine's
+        // whole-file-temp downloaders — so a cancel / app-quit / stall keeps the bytes already
+        // fetched and continues from there. We write into the SAME dirs the engine reads back.
+        switch kind {
+        case .transformer(let v):
+            try await ResumableDownloader.download(
+                repoId: v.huggingFaceRepo,
+                subfolder: v.huggingFaceSubfolder,
+                destDir: ModelRegistry.localPath(for: .transformer(v)),
+                token: hfToken,
+                onProgress: onProgress)
+        case .encoder(let v):
+            try await ResumableDownloader.download(
+                repoId: v.repoId,
+                subfolder: nil,   // Qwen3 encoder repos keep weights at root
+                destDir: AppPaths.models.appendingPathComponent(v.repoId, isDirectory: true),
+                token: hfToken,   // encoders are ungated; harmless if nil
+                onProgress: onProgress)
+        }
     }
 
-    /// Pre-download the tier's Qwen3 text encoder (tokenless). Without this the engine
-    /// fetches it lazily and SILENTLY inside the first generation's Phase 1 — a multi-GB
-    /// stall with no progress UI. Fast-returns if already on disk.
-    func downloadEncoder(
-        tier: ModelTier,
-        onProgress: @escaping @Sendable (Double, String) -> Void
-    ) async throws {
-        let downloader = TextEncoderModelDownloader()
-        _ = try await downloader.downloadQwen3(variant: tier.encoderVariant) { p, m in
-            onProgress(p, m)
+    /// Delete one component. Returns bytes reclaimed, or nil for a symlink-import.
+    func delete(kind: ComponentKind) throws -> Int64? {
+        switch kind {
+        case .transformer(let v):
+            let comp = ModelRegistry.ModelComponent.transformer(v)
+            // findModelPath keeps the unresolved URL, so removeItem deletes only the link.
+            if let path = Flux2ModelDownloader.findModelPath(for: comp), Self.isSymlink(path) {
+                try FileManager.default.removeItem(at: path)
+                return nil
+            }
+            let before = Flux2ModelDownloader.isDownloaded(comp) ? Self.transformerBytes(v) : 0
+            try Flux2ModelDownloader.delete(comp)
+            return before
+        case .encoder(let v):
+            let url = AppPaths.models.appendingPathComponent(v.repoId, isDirectory: true)
+            guard FileManager.default.fileExists(atPath: url.path) else { return 0 }
+            if Self.isSymlink(url) {
+                try FileManager.default.removeItem(at: url)
+                return nil
+            }
+            let size = Self.directorySize(url)
+            try FileManager.default.removeItem(at: url)
+            return size
         }
     }
 
     // MARK: Integrity pin
 
-    /// SHA-256 pins for transformers fetched from COMMUNITY repos. The engine downloads
-    /// from the mutable `main` branch and verifies file PRESENCE only — the repo owner
-    /// could swap weights at any time (v0.38 policy: pin what we verified, like the
-    /// Real-ESRGAN binary). BFL's own gated repos are deliberately not pinned.
-    private static let pinnedTransformerSHA256: [ModelTier: String] = [
+    /// SHA-256 pins for transformers fetched from COMMUNITY repos. The engine downloads from the
+    /// mutable `main` branch and verifies file PRESENCE only — the repo owner could swap weights
+    /// at any time (v0.38 policy). BFL's own gated repos are deliberately not pinned.
+    private static let pinnedTransformerSHA256: [ModelRegistry.TransformerVariant: String] = [
         // aydin99/FLUX.2-klein-4B-int8 · diffusion_pytorch_model.safetensors (3,877,645,084 bytes)
         // Verified on download 2026-06-10; size byte-matched the HF API listing.
-        .klein4B: "fb6e95fd62f2af89151cef9f22a99da842a0968ecec35bdeaf8d58403ad14f8d",
+        .klein4B_8bit: "fb6e95fd62f2af89151cef9f22a99da842a0968ecec35bdeaf8d58403ad14f8d",
     ]
 
-    /// Throws (and removes the directory) when a pinned tier's main weight file doesn't
-    /// match its recorded hash. No-op for unpinned tiers or missing files.
-    func verifyTransformerIntegrity(tier: ModelTier) throws {
-        guard let expected = Self.pinnedTransformerSHA256[tier],
-              expected.count == 64 else { return }   // unpinned tier → nothing to check
-        let comp = ModelRegistry.ModelComponent.transformer(tier.transformerVariant)
-        // A pinned tier whose expected file is MISSING is a failure, not a skip — an
-        // upstream rename/reshard would otherwise silently disarm the pin forever.
+    /// Throws (and removes the directory) when a pinned variant's main weight file doesn't match
+    /// its recorded hash. No-op for unpinned variants or missing files.
+    func verifyTransformerIntegrity(variant: ModelRegistry.TransformerVariant) throws {
+        guard let expected = Self.pinnedTransformerSHA256[variant],
+              expected.count == 64 else { return }   // unpinned → nothing to check
+        let comp = ModelRegistry.ModelComponent.transformer(variant)
         guard let dir = Flux2ModelDownloader.findModelPath(for: comp) else {
             throw ModelStoreError.pinnedFileMissing
         }
@@ -156,7 +273,7 @@ actor ModelStore {
             try? FileManager.default.removeItem(at: dir)
             throw ModelStoreError.integrityMismatch(expected: expected, actual: actual)
         }
-        AppLog.info("Transformer integrity OK (\(tier.shortName), SHA-256 \(actual.prefix(12))…)")
+        AppLog.info("Transformer integrity OK (\(variant.rawValue), SHA-256 \(actual.prefix(12))…)")
     }
 
     private static func sha256(of url: URL) throws -> String {
@@ -165,12 +282,8 @@ actor ModelStore {
         var hasher = SHA256()
         while true {
             // The SHA-256 pin is the ONLY integrity gate, so the hash is deliberately NOT
-            // cancellable: a Cancel landing mid-hash must not abort verification and leave a
-            // complete-but-UNVERIFIED transformer on disk (nothing re-verifies it afterwards, and
-            // the generate path loads it unchecked). The pass is only seconds for the pinned 4B
-            // weight; the download caller honors the cancel right AFTER verify returns. (Throwing
-            // read API — readData raises uncatchable ObjC exceptions on I/O errors; a genuine I/O
-            // error still throws and is reported as a real failure, not as a cancel.)
+            // cancellable: a Cancel landing mid-hash must not leave a complete-but-UNVERIFIED
+            // transformer on disk. The pass is only seconds for the pinned 4B weight.
             guard let chunk = try autoreleasepool(invoking: { try handle.read(upToCount: 8 * 1024 * 1024) }),
                   !chunk.isEmpty else { break }
             hasher.update(data: chunk)
@@ -178,18 +291,29 @@ actor ModelStore {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Delete a tier's transformer. Returns bytes reclaimed, or nil when the target was
-    /// a symlink-import — removing the link frees ~nothing, so no freed-bytes figure.
-    func delete(tier: ModelTier) throws -> Int64? {
-        let comp = ModelRegistry.ModelComponent.transformer(tier.transformerVariant)
-        // findModelPath keeps the unresolved URL, so removeItem deletes only the link.
-        if let path = Flux2ModelDownloader.findModelPath(for: comp), Self.isSymlink(path) {
-            try FileManager.default.removeItem(at: path)
-            return nil
+    // MARK: On-disk helpers
+
+    /// True when the variant's Qwen3 encoder is on disk under the app's Models dir — config.json
+    /// plus all index shards (config alone is NOT proof: an interrupted download leaves config
+    /// without weights, and the engine would then lazy-fetch GBs silently).
+    private static func encoderDownloaded(_ v: Qwen3Variant) -> Bool {
+        let fm = FileManager.default
+        let dir = AppPaths.models.appendingPathComponent(v.repoId, isDirectory: true)
+        guard fm.fileExists(atPath: dir.appendingPathComponent("config.json").path) else { return false }
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("model.safetensors.index.json")),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let map = obj["weight_map"] as? [String: String] {
+            let shards = Set(map.values)
+            return !shards.isEmpty && shards.allSatisfy {
+                fm.fileExists(atPath: dir.appendingPathComponent($0).path)
+            }
         }
-        let before = Flux2ModelDownloader.isDownloaded(comp) ? sizeOf(comp) : 0
-        try Flux2ModelDownloader.delete(comp)
-        return before
+        return fm.fileExists(atPath: dir.appendingPathComponent("model.safetensors").path)
+    }
+
+    private static func transformerBytes(_ v: ModelRegistry.TransformerVariant) -> Int64 {
+        guard let path = Flux2ModelDownloader.findModelPath(for: .transformer(v)) else { return 0 }
+        return directorySize(path)
     }
 
     /// attributesOfItem does NOT follow links — exactly what the delete paths need.
@@ -197,17 +321,11 @@ actor ModelStore {
         (try? FileManager.default.attributesOfItem(atPath: url.path))?[.type] as? FileAttributeType == .typeSymbolicLink
     }
 
-    private func sizeOf(_ comp: ModelRegistry.ModelComponent) -> Int64 {
-        guard let path = Flux2ModelDownloader.findModelPath(for: comp) else { return 0 }
-        return Self.directorySize(path)
-    }
-
     private static func directorySize(_ url: URL) -> Int64 {
         let fm = FileManager.default
         var total: Int64 = 0
-        // Imported components may be SYMLINKS to the user's originals — an enumerator
-        // rooted at a link yields zero items, showing 0 B. Resolve first; delete paths
-        // intentionally keep the unresolved URL (removing a link must not touch originals).
+        // Imported components may be SYMLINKS to the user's originals — an enumerator rooted at a
+        // link yields zero items. Resolve first; delete paths keep the unresolved URL.
         let resolved = url.resolvingSymlinksInPath()
         if let en = fm.enumerator(at: resolved, includingPropertiesForKeys: [.totalFileAllocatedSizeKey]) {
             for case let f as URL in en {

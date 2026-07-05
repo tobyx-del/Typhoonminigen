@@ -5,10 +5,12 @@ import Foundation
 struct Generation: Codable, Identifiable, Sendable, Hashable {
     let id: UUID
     let prompt: String
+    let enhancedPrompt: String?  // rewritten prompt the engine actually used when "Enhance" was on; nil otherwise / old records
     let seed: UInt64
     let modelTier: String        // ModelTier.rawValue
     let steps: Int
     let guidance: Float
+    let quality: String?         // QualityPreset.rawValue (Low/Medium/…); nil for old records
     let width: Int
     let height: Int
     let loraName: String?        // legacy single-LoRA fields (records before dual LoRA);
@@ -17,16 +19,20 @@ struct Generation: Codable, Identifiable, Sendable, Hashable {
     let createdAt: Date
     let imageFileName: String    // relative to AppPaths.images
     let referenceImagePath: String?      // legacy single reference (records before v0.30)
-    let referenceImagePaths: [String]?   // I2I reference file paths (up to 3, informational)
+    let referenceImagePaths: [String]?   // I2I reference file paths (up to 4, informational)
     let durationSeconds: Double?     // wall-clock seconds the generation took (nil for old records)
+    let secondsPerStep: Double?      // smoothed denoise pace (nil for old records)
+    let peakRAMGB: Double?           // app phys_footprint peak during the render (nil for old records)
 
     init(
         id: UUID = UUID(),
         prompt: String,
+        enhancedPrompt: String? = nil,
         seed: UInt64,
         modelTier: String,
         steps: Int,
         guidance: Float,
+        quality: String? = nil,
         width: Int,
         height: Int,
         loraName: String? = nil,
@@ -36,14 +42,18 @@ struct Generation: Codable, Identifiable, Sendable, Hashable {
         imageFileName: String,
         referenceImagePath: String? = nil,
         referenceImagePaths: [String]? = nil,
-        durationSeconds: Double? = nil
+        durationSeconds: Double? = nil,
+        secondsPerStep: Double? = nil,
+        peakRAMGB: Double? = nil
     ) {
         self.id = id
         self.prompt = prompt
+        self.enhancedPrompt = enhancedPrompt
         self.seed = seed
         self.modelTier = modelTier
         self.steps = steps
         self.guidance = guidance
+        self.quality = quality
         self.width = width
         self.height = height
         self.loraName = loraName
@@ -54,6 +64,8 @@ struct Generation: Codable, Identifiable, Sendable, Hashable {
         self.referenceImagePath = referenceImagePath
         self.referenceImagePaths = referenceImagePaths
         self.durationSeconds = durationSeconds
+        self.secondsPerStep = secondsPerStep
+        self.peakRAMGB = peakRAMGB
     }
 
     /// Absolute URL of the image on disk.

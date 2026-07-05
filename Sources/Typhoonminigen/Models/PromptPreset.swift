@@ -123,9 +123,9 @@ enum PromptPresets {
     /// the 2026-06 reform + studio pack — everything dropped returns in seconds via custom chips).
     /// Phrases are English — the known-good vocabulary is English and the model is
     /// English-caption-trained; the user can still type the subject in any language.
-    /// Built-in + generated Library chips for a category (the Library 171 are appended).
+    /// Built-in + generated Library chips for a category (the Library 171 + the 2.0-rebuild 98 are appended).
     static func presets(for category: PromptPresetCategory) -> [PromptPreset] {
-        builtinPresets(for: category) + PromptPresetLibrary.newChips(for: category)
+        builtinPresets(for: category) + PromptPresetLibrary.newChips(for: category) + PromptPresetLibrary.rebuildChips(for: category)
     }
 
     static func builtinPresets(for category: PromptPresetCategory) -> [PromptPreset] {

@@ -179,10 +179,17 @@ enum UpscaleService {
 
         let done = DispatchSemaphore(value: 0)
         p.terminationHandler = { _ in done.signal() }
-        processLock.lock(); currentProcess = p; processLock.unlock()
-        defer { processLock.lock(); currentProcess = nil; processLock.unlock() }
 
         try p.run()
+        // Publish to the quit-time terminate slot only AFTER a successful launch: calling
+        // terminate() on a never-run Process raises an ObjC exception, and terminateCurrent()
+        // (applicationWillTerminate) fires unconditionally — assigning before run() meant a
+        // failed launch (missing/quarantined binary) parked an un-terminatable zombie in the
+        // slot until the defer, crashing a quit that raced the throw. Once run() succeeded,
+        // terminate() is legal even if the child already exited. The defer is registered
+        // after run() on purpose: if run() throws, the slot was never set — nothing to clear.
+        processLock.lock(); currentProcess = p; processLock.unlock()
+        defer { processLock.lock(); currentProcess = nil; processLock.unlock() }
         // A wedged child used to block this thread forever and latch isUpscaling until
         // relaunch — give it a generous ceiling, then terminate (SIGKILL as last resort).
         if done.wait(timeout: .now() + timeout) == .timedOut {

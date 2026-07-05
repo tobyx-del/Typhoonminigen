@@ -52,6 +52,18 @@ enum UpdateService {
         }
     }
 
+    /// The release page URL ends up opened in the user's browser (ContentView's update pill).
+    /// It arrives from an unauthenticated JSON API response — never trust it verbatim: accept
+    /// only an https github.com page, otherwise drop the candidate entirely (a spoofed/MITM'd
+    /// response, or a compromised cached UserDefaults value, must not be able to send the
+    /// user's browser to an arbitrary site under the guise of "Update available").
+    private static func validatedReleaseURL(_ raw: String) -> URL? {
+        guard let url = URL(string: raw),
+              url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == "github.com" else { return nil }
+        return url
+    }
+
     /// Returns the release to advertise, or nil. A release found earlier is re-surfaced
     /// from UserDefaults on every launch — until dismissed, or stale because the app
     /// caught up — even inside the network throttle window. The throttle stamps the ATTEMPT
@@ -65,7 +77,7 @@ enum UpdateService {
         let cachedCandidate: UpdateInfo? = {
             guard let tag = defaults.string(forKey: foundTagKey),
                   let raw = defaults.string(forKey: foundURLKey),
-                  let url = URL(string: raw) else { return nil }
+                  let url = validatedReleaseURL(raw) else { return nil }   // re-validate the cache too
             let remote = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
             guard isNewer(remote: remote, local: AppVersion.current) else {
                 // Stale after the user updates — forget it.
@@ -110,9 +122,11 @@ enum UpdateService {
         switch status {
         case 200:
             if let newETag { defaults.set(newETag, forKey: etagKey) }
+            // Validate BEFORE the html_url is stored in UserDefaults (a bad value must not be
+            // resurfaced by cachedCandidate on every future launch either).
             guard let release = try? JSONDecoder().decode(Release.self, from: data),
-                  let url = URL(string: release.htmlURL) else {
-                AppLog.info("Update check: could not parse the release response")
+                  let url = validatedReleaseURL(release.htmlURL) else {
+                AppLog.info("Update check: could not parse/validate the release response")
                 return cachedCandidate
             }
             let tag = release.tagName

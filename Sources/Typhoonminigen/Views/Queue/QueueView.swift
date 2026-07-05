@@ -13,6 +13,8 @@ struct QueueView: View {
     @State private var editW = ""
     @State private var editH = ""
     @State private var editSeed = ""
+    @State private var editSteps = ""
+    @State private var editQuality: QualityPreset = .medium
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -59,6 +61,15 @@ struct QueueView: View {
                 Button("Stop after this image") { vm.cancel() }
                     .buttonStyle(FxGhostButtonStyle(height: 30, accentText: true))
                     .help("The current image can't be interrupted — it finishes, then the queue stops; pending tasks are kept (Run all to resume).")
+            } else if vm.queueArmedAfterTraining {
+                HStack(spacing: 7) {
+                    FxDot(tone: .amber, live: true, size: 7)
+                    Text("Waiting for the training to finish — starts automatically")
+                        .font(.fxMono(11)).foregroundStyle(Color.fxText2)
+                }
+                Button("Cancel") { vm.disarmAfterTraining() }
+                    .buttonStyle(FxGhostButtonStyle(height: 30))
+                    .help("Disarm — the queue stays as it is and won't auto-start.")
             } else if !vm.queue.isEmpty {
                 Button { vm.clearQueue() } label: { Text("Clear") }
                     .buttonStyle(FxGhostButtonStyle(height: 30))
@@ -79,6 +90,9 @@ struct QueueView: View {
     private var headerSubtitle: String {
         if vm.queueRunning {
             return "Running · image \(min(vm.queueDone + 1, max(vm.queueTotal, 1))) of \(max(vm.queueTotal, 1))"
+        }
+        if vm.queueArmedAfterTraining {
+            return "\(vm.queue.count) task\(vm.queue.count == 1 ? "" : "s") armed — runs after the training"
         }
         if vm.queue.isEmpty { return "No tasks yet" }
         return "\(vm.queue.count) task\(vm.queue.count == 1 ? "" : "s") ready"
@@ -118,30 +132,60 @@ struct QueueView: View {
 
     private func displayCard(_ item: GenerateViewModel.QueueItem, index: Int) -> some View {
         let isRunning = item.id == vm.currentItemID
+        let isUpscale: Bool = { if case .upscale = item.kind { return true } else { return false } }()
         return HStack(alignment: .top, spacing: 12) {
             ZStack {
                 Circle().fill(isRunning ? Color.fxAccent : Color.fxInset).frame(width: 26, height: 26)
                 if isRunning {
                     Image(systemName: "bolt.fill").font(.system(size: 11)).foregroundStyle(Color.fxOnAccent)
+                } else if isUpscale {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right").font(.system(size: 10)).foregroundStyle(Color.fxText2)
                 } else {
                     Text("\(index + 1)").font(.fxMono(11)).foregroundStyle(Color.fxText2)
                 }
             }
             VStack(alignment: .leading, spacing: 6) {
-                Text(item.request.prompt.isEmpty ? "(empty prompt)" : item.request.prompt)
-                    .font(.fx(12.5)).foregroundStyle(Color.fxText)
-                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 6) {
-                    chip(item.request.tier.shortName)
-                    chip("\(item.request.width)×\(item.request.height)")
-                    chip(seedText(item.request.seed))
-                    if !item.request.loras.isEmpty { chip("LoRA ×\(item.request.loras.count)") }
-                    if !item.referenceImages.isEmpty { chip("ref ×\(item.referenceImages.count)") }
+                if case .upscale(let source, let factor) = item.kind {
+                    Text("Upscale ×\(factor) — \(source.lastPathComponent)")
+                        .font(.fx(12.5)).foregroundStyle(Color.fxText)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        chip("Real-ESRGAN")
+                        chip("×\(factor)")
+                        if !FileManager.default.fileExists(atPath: source.path) {
+                            chip("source missing").foregroundStyle(Color.fxDanger)
+                        }
+                    }
+                } else {
+                    Text(item.request.prompt.isEmpty ? "(empty prompt)" : item.request.prompt)
+                        .font(.fx(12.5)).foregroundStyle(Color.fxText)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 6) {
+                        chip(item.request.tier.shortName)
+                        if let q = item.request.quality, let label = QualityPreset(rawValue: q)?.label { chip(label) }
+                        chip("\(item.request.width)×\(item.request.height)")
+                        chip("\(item.request.steps) steps")
+                        chip(seedText(item.request.seed))
+                        if !item.request.loras.isEmpty { chip("LoRA ×\(item.request.loras.count)") }
+                        if !item.referenceImages.isEmpty { chip("ref ×\(item.referenceImages.count)") }
+                    }
                 }
             }
             Spacer(minLength: 4)
             if isRunning {
-                Text("rendering…").font(.fxMono(10.5)).foregroundStyle(Color.fxAccent)
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(isUpscale ? "upscaling…" : (vm.currentStep == 0 ? (vm.renderPhase ?? "rendering…") : "rendering…"))
+                        .font(.fxMono(10.5)).foregroundStyle(Color.fxAccent)
+                        .lineLimit(1).frame(maxWidth: 220, alignment: .trailing)
+                    if !isUpscale, vm.renderSteps > 0, vm.currentStep > 0 {
+                        Text("step \(vm.currentStep) / \(vm.renderSteps)"
+                             + (vm.lastStepSeconds.map { String(format: " · %.1f s/step", $0) } ?? ""))
+                            .font(.fxMono(10.5)).foregroundStyle(Color.fxText2)
+                    }
+                    if !isUpscale, let eta = vm.etaSeconds, eta > 0 {
+                        Text(etaText(eta)).font(.fxMono(10.5)).foregroundStyle(Color.fxText3)
+                    }
+                }
             } else {
                 actions(item, index: index)
             }
@@ -154,28 +198,33 @@ struct QueueView: View {
 
     private func actions(_ item: GenerateViewModel.QueueItem, index: Int) -> some View {
         HStack(spacing: 8) {
+            Button { vm.moveTaskToTop(item.id) } label: { Image(systemName: "chevron.up.to.line") }
+                .disabled(index == 0 || vm.queue[index - 1].id == vm.currentItemID)
+                .help("Move to top")
             Button { vm.moveTask(item.id, up: true) } label: { Image(systemName: "chevron.up") }
                 .disabled(index == 0 || vm.queue[index - 1].id == vm.currentItemID)
                 .help("Move up")
             Button { vm.moveTask(item.id, up: false) } label: { Image(systemName: "chevron.down") }
                 .disabled(index == vm.queue.count - 1)
                 .help("Move down")
-            Button { beginEdit(item) } label: { Image(systemName: "pencil") }
-                .help("Edit this task's prompt, size and seed")
-            Menu {
-                Button("Duplicate (new seed)") { vm.duplicateTask(item.id, count: 1, seedMode: .newRandom) }
-                Button("Duplicate ×3 (new seeds)") { vm.duplicateTask(item.id, count: 3, seedMode: .newRandom) }
-                Button("Duplicate ×5 (new seeds)") { vm.duplicateTask(item.id, count: 5, seedMode: .newRandom) }
-                Button("Duplicate ×10 (new seeds)") { vm.duplicateTask(item.id, count: 10, seedMode: .newRandom) }
-                Divider()
-                Button("Duplicate (same seed)") { vm.duplicateTask(item.id, count: 1, seedMode: .same) }
-                Button("Duplicate ×5 (sequential seeds)") { vm.duplicateTask(item.id, count: 5, seedMode: .sequential) }
-            } label: {
-                Image(systemName: "plus.square.on.square")
+            if item.kind == .generation {
+                Button { beginEdit(item) } label: { Image(systemName: "pencil") }
+                    .help("Edit this task's prompt, size and seed")
+                Menu {
+                    Button("Duplicate (new seed)") { vm.duplicateTask(item.id, count: 1, seedMode: .newRandom) }
+                    Button("Duplicate ×3 (new seeds)") { vm.duplicateTask(item.id, count: 3, seedMode: .newRandom) }
+                    Button("Duplicate ×5 (new seeds)") { vm.duplicateTask(item.id, count: 5, seedMode: .newRandom) }
+                    Button("Duplicate ×10 (new seeds)") { vm.duplicateTask(item.id, count: 10, seedMode: .newRandom) }
+                    Divider()
+                    Button("Duplicate (same seed)") { vm.duplicateTask(item.id, count: 1, seedMode: .same) }
+                    Button("Duplicate ×5 (sequential seeds)") { vm.duplicateTask(item.id, count: 5, seedMode: .sequential) }
+                } label: {
+                    Image(systemName: "plus.square.on.square")
+                }
+                .menuStyle(.borderlessButton)
+                .frame(width: 30)
+                .help("Duplicate this task — new random seeds give different variants of the same prompt.")
             }
-            .menuStyle(.borderlessButton)
-            .frame(width: 30)
-            .help("Duplicate this task — new random seeds give different variants of the same prompt.")
             Button { vm.removeQueued(item.id) } label: { Image(systemName: "xmark") }
                 .help("Remove this task")
         }
@@ -191,6 +240,8 @@ struct QueueView: View {
         editW = String(item.request.width)
         editH = String(item.request.height)
         editSeed = item.request.seed.map(String.init) ?? ""
+        editSteps = String(item.request.steps)
+        editQuality = QualityPreset(rawValue: item.request.quality ?? "") ?? item.request.tier.defaultQuality
         editingID = item.id
     }
 
@@ -205,7 +256,8 @@ struct QueueView: View {
         if trimmedSeed.isEmpty { seed = nil }
         else if digits.isEmpty { seed = item.request.seed }
         else { seed = UInt64(digits) ?? item.request.seed }
-        vm.updateTask(item.id, prompt: editPrompt, width: w, height: h, seed: seed)
+        let steps = Int(editSteps.filter(\.isNumber)) ?? item.request.steps
+        vm.updateTask(item.id, prompt: editPrompt, width: w, height: h, seed: seed, steps: steps, quality: editQuality)
         editingID = nil
     }
 
@@ -220,9 +272,11 @@ struct QueueView: View {
                 .background(Color.fxBg, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.fxBorder, lineWidth: 1))
             HStack(spacing: 8) {
-                editField("Width", text: $editW, width: 72)
-                editField("Height", text: $editH, width: 72)
-                editField("Seed", text: $editSeed, width: 140, placeholder: "random")
+                editField("Width", text: $editW, width: 64)
+                editField("Height", text: $editH, width: 64)
+                editField("Steps", text: $editSteps, width: 56)
+                qualityEditMenu(item)
+                editField("Seed", text: $editSeed, width: 120, placeholder: "random")
                 Spacer(minLength: 8)
                 Button("Cancel") { editingID = nil }
                     .buttonStyle(FxGhostButtonStyle(height: 28))
@@ -248,6 +302,30 @@ struct QueueView: View {
         }
     }
 
+    private func qualityEditMenu(_ item: GenerateViewModel.QueueItem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Quality").font(.fxMono(9)).foregroundStyle(Color.fxText3)
+            Menu {
+                ForEach(item.request.tier.qualityPresets) { q in
+                    Button {
+                        editQuality = q
+                    } label: {
+                        if editQuality == q { Label(q.label, systemImage: "checkmark") } else { Text(q.label) }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(editQuality.label).font(.fxMono(11)).foregroundStyle(Color.fxText)
+                    Image(systemName: "chevron.down").font(.system(size: 9)).foregroundStyle(Color.fxText3)
+                }
+                .padding(.vertical, 5).padding(.horizontal, 8)
+                .background(Color.fxBg, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Color.fxBorder, lineWidth: 1))
+            }
+            .menuStyle(.button).menuIndicator(.hidden).buttonStyle(.plain).fixedSize()
+        }
+    }
+
     private func chip(_ s: String) -> some View {
         Text(s).font(.fxMono(10)).foregroundStyle(Color.fxText3)
             .padding(.vertical, 2).padding(.horizontal, 7)
@@ -259,5 +337,11 @@ struct QueueView: View {
         guard let s = seed else { return "random" }
         let str = String(s)
         return str.count > 8 ? "seed \(str.prefix(6))…" : "seed \(str)"
+    }
+
+    /// Compact ETA for the running row (mirrors the Generate panel's etaHuman).
+    private func etaText(_ s: Double) -> String {
+        if s < 90 { return "~\(Int(s.rounded())) s left" }
+        return "~\(Int((s / 60).rounded(.up))) min left"
     }
 }

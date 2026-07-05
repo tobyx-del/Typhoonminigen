@@ -88,14 +88,16 @@ struct SystemView: View {
                 .help("Delete gallery thumbnails and the MLX buffer pool — both rebuild on demand")
             Button("Clear logs") { vm.clearLogs() }.buttonStyle(FxSecondaryButtonStyle(height: 32))
                 .help("Empty the app's log file")
+            Button("Repair library") { vm.repairLibrary() }.buttonStyle(FxSecondaryButtonStyle(height: 32))
+                .help("Sync the gallery with the Images folder: files you moved in by hand are re-adopted with their full recipe (from the PNG itself), records whose file was deleted in Finder are removed, and unreadable strays go to a Quarantine folder — nothing is ever deleted.")
             Button("Remove all data…") { confirmRemoveAll = true }
                 .buttonStyle(FxSecondaryButtonStyle(height: 32, accentText: true))
-                .help("Delete EVERYTHING this app stored — models, encoders, the HuggingFace cache, your gallery images, LoRAs, presets and logs. Use this BEFORE dragging the app to the Trash so nothing is left behind.")
+                .help("Delete EVERYTHING this app stored — models, encoders, this app's HuggingFace cache entries, your gallery images, LoRAs, presets and logs. Use this BEFORE dragging the app to the Trash so nothing is left behind.")
                 .confirmationDialog("Remove all models & data?", isPresented: $confirmRemoveAll, titleVisibility: .visible) {
                     Button("Remove everything", role: .destructive) { vm.removeAllData() }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("Permanently deletes all downloaded models + encoders, the HuggingFace cache, every image in your gallery, your LoRAs, presets and logs — no Trash. Do this right before deleting the app. The app itself stays until you trash it.")
+                    Text("Permanently deletes all downloaded models + encoders, this app's entries in the shared HuggingFace cache (other tools' caches are untouched), every image in your gallery, your LoRAs, presets and logs — no Trash. Do this right before deleting the app. The app itself stays until you trash it.")
                 }
         }
         .padding(.top, 2)

@@ -1,0 +1,54 @@
+From 4945248e0d7b919142562de84d8cc27e8197de41 Mon Sep 17 00:00:00 2001
+From: abgitdev <266600699+abgitdev@users.noreply.github.com>
+Date: Fri, 3 Jul 2026 03:59:02 +0800
+Subject: [PATCH] Fix RoPE cache collision: key by grid extents, not just
+ sequence length
+
+Transposed image sizes (1312x736 vs 736x1312) produce the same combined
+sequence length (text is right-padded to a fixed 512 tokens) but different
+(H, W) position grids. The length-only cache key returned the other
+orientation's rotary tables, shredding the render into repeated bands.
+
+Repro: render landscape, then portrait of the transposed size in the same
+process (or vice versa) - the second image collapses. Key now includes the
+last token's (T, H, W, L) coordinates, which identify the grid.
+---
+ Sources/Flux2Core/Transformer/Flux2RoPE.swift | 20 ++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/Sources/Flux2Core/Transformer/Flux2RoPE.swift b/Sources/Flux2Core/Transformer/Flux2RoPE.swift
+index a758176..bfbe63d 100644
+--- a/Sources/Flux2Core/Transformer/Flux2RoPE.swift
++++ b/Sources/Flux2Core/Transformer/Flux2RoPE.swift
+@@ -60,13 +60,23 @@ public class Flux2RoPE: Module, @unchecked Sendable {
+         return freqs
+     }
+ 
+-    /// Generate cache key from position IDs shape
+-    /// For deterministic position IDs (text/image), shape uniquely identifies the embeddings
++    /// Generate cache key from position IDs shape AND grid extents
++    ///
++    /// LOCAL PATCH (Typhoonminigen, 2026-07-03): the sequence length alone does NOT uniquely
++    /// identify the embeddings — transposed image sizes (e.g. 1312×736 vs 736×1312, with text
++    /// always right-padded to a fixed 512 tokens) produce the SAME combined length but
++    /// DIFFERENT (H, W) position grids. A length-only key then returns the OTHER orientation's
++    /// rotary tables and the render collapses into repeated bands (reproduced: portrait after
++    /// landscape or vice versa within one loaded transformer). Include the last token's
++    /// (T, H, W, L) coordinates in the key — the final row of the combined ids is the image's
++    /// (or last reference's) bottom-right patch, which disambiguates the grid.
+     private func cacheKey(for ids: MLXArray) -> String {
+-        // Shape-based key: seqLen determines the embeddings
+-        // We also include a hash of first/last positions for extra safety
+         let seqLen = ids.shape[0]
+-        return "rope_\(seqLen)"
++        let last = ids[seqLen - 1]                 // [4] — (T, H, W, L) of the final token
++        let t = last[0].item(Int32.self)
++        let h = last[1].item(Int32.self)
++        let w = last[2].item(Int32.self)
++        return "rope_\(seqLen)_\(t)_\(h)x\(w)"
+     }
+ 
+     /// Generate rotary embeddings for position IDs
+-- 
+2.50.1 (Apple Git-155)
+

@@ -20,7 +20,7 @@ struct TierComparisonCard: View {
         Row(label: "HuggingFace token", k4: "not needed", k9: "required (gated)"),
         Row(label: "License", k4: "Apache 2.0", k9: "FLUX Non-Commercial"),
         Row(label: "LoRA adapters", k4: "dim 3072 only", k9: "dim 4096 only"),
-        Row(label: "References (I2I)", k4: "up to 3", k9: "up to 3"),
+        Row(label: "References (I2I)", k4: "up to 4", k9: "up to 4"),   // GenerateViewModel.maxReferences
         Row(label: "Speed / quality", k4: "~1 min per 1024² image", k9: "~2¼ min, best quality"),
     ]
 

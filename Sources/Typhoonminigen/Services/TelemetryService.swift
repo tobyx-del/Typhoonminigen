@@ -25,6 +25,12 @@ final class TelemetryService {
     private(set) var ramHistory: [Double] = []      // GB — whole-system RAM used
     private let historyLen = 48
 
+    /// Red status-bar chip text while swap / free disk crosses the danger line, nil when healthy.
+    /// The guarded incident: a marathon session's heap bloat pushed swap to 12.8 GB, the swap file
+    /// filled the disk to ~350 MB free, and jetsam killed the app mid-render — warn BEFORE that.
+    /// Hysteresis (danger ≠ safe thresholds) so the chip doesn't flicker at the boundary.
+    private(set) var healthWarning: String?
+
     private var loop: Task<Void, Never>?
     private var prevTicks: CPUTicks?
     private let gpuName: String = MTLCreateSystemDefaultDevice()?.name ?? "Apple GPU"
@@ -64,7 +70,22 @@ final class TelemetryService {
                 self.prevTicks = ticks
                 self.snapshot = snap
                 self.pushHistory(snap)
+                self.updateHealthWarning(snap)
             }
+        }
+    }
+
+    /// Swap > 10 GB or free disk < 5 GB → warn; clears only once BOTH are comfortably back
+    /// (swap < 6 GB and disk > 10 GB). Numbers refresh every tick while the warning is up.
+    private func updateHealthWarning(_ s: TelemetrySnapshot) {
+        let swapGB = Double(s.swapUsedBytes) / Double(SystemRAM.bytesPerGiB)
+        let diskGB = Double(s.diskFreeBytes) / Double(SystemRAM.bytesPerGiB)
+        let danger = swapGB > 10 || diskGB < 5
+        let safe   = swapGB < 6 && diskGB > 10
+        if danger {
+            healthWarning = "swap \(String(format: "%.1f", swapGB)) GB · disk \(String(format: "%.1f", diskGB)) GB free"
+        } else if safe {
+            healthWarning = nil
         }
     }
 
@@ -77,9 +98,9 @@ final class TelemetryService {
     private func pushHistory(_ s: TelemetrySnapshot) {
         push(&cpuHistory, s.cpuPercent)
         push(&gpuHistory, s.gpuPercent)
-        push(&mlxHistory, Double(s.mlxActiveBytes) / 1_073_741_824)
-        push(&appMemHistory, Double(s.appFootprintBytes) / 1_073_741_824)
-        push(&ramHistory, Double(s.systemUsedBytes) / 1_073_741_824)
+        push(&mlxHistory, Double(s.mlxActiveBytes) / Double(SystemRAM.bytesPerGiB))
+        push(&appMemHistory, Double(s.appFootprintBytes) / Double(SystemRAM.bytesPerGiB))
+        push(&ramHistory, Double(s.systemUsedBytes) / Double(SystemRAM.bytesPerGiB))
     }
 
     private func push(_ buf: inout [Double], _ value: Double) {
@@ -135,6 +156,11 @@ final class TelemetryService {
         guard totalTicks > 0 else { return (fallback, cur) }
         return (max(0, min(100, (user + system + nice) / totalTicks * 100)), cur)
     }
+
+    /// Public snapshot of the app's REAL memory footprint in GB (phys_footprint — what Activity
+    /// Monitor shows; ps-rss undercounts MLX/Metal unified memory). Used for per-render peak-RAM
+    /// telemetry; same source as the status-bar readout so the numbers agree.
+    nonisolated static func footprintGB() -> Double { Double(appFootprint()) / Double(SystemRAM.bytesPerGiB) }
 
     private nonisolated static func appFootprint() -> Int64 {
         var info = task_vm_info_data_t()

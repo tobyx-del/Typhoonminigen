@@ -21,18 +21,10 @@ final class CustomPresetStore {
     private static let hiddenKey = "hiddenPresetIDs"
 
     init() {
-        if let data = try? Data(contentsOf: fileURL), !data.isEmpty {
-            if let list = try? JSONDecoder().decode([CustomPreset].self, from: data) {
-                items = list
-            } else {
-                // Don't silently wipe the user's chips: keep the unreadable file as a backup
-                // so the next save() can't overwrite it into oblivion.
-                let backup = fileURL.deletingLastPathComponent().appendingPathComponent("custom-presets.corrupt.json")
-                try? FileManager.default.removeItem(at: backup)
-                try? FileManager.default.moveItem(at: fileURL, to: backup)
-                AppLog.error("custom-presets.json unreadable — kept a backup as custom-presets.corrupt.json")
-            }
-        }
+        // Per-record salvage + timestamped keep-3 quarantine (CustomStoreJSON.load, in
+        // CustomRecipeStore.swift) — the old whole-array decode wiped every chip over one
+        // malformed record, and its single fixed-name backup was clobbered by the next event.
+        items = CustomStoreJSON.load([CustomPreset].self, from: fileURL, label: "custom-presets")
         hiddenIDs = Set(UserDefaults.standard.array(forKey: Self.hiddenKey) as? [String] ?? [])
     }
 

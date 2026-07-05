@@ -20,6 +20,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Package.swift pins the engine as a local sibling checkout (../flux-2-swift-mlx-patched):
+      # upstream v2.4.0 + the vendored patches (RoPE-cache fix, DOP caption fix). Temporary
+      # until upstream ships them. Patches apply in filename order — keep the 000N- prefixes.
+      - name: Set up engine fork (upstream v2.4.0 + vendored patches)
+        run: |
+          git clone --branch v2.4.0 --depth 1 https://github.com/VincentGourbin/flux-2-swift-mlx.git "$GITHUB_WORKSPACE/../flux-2-swift-mlx-patched"
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            echo "Applying $(basename "$p")"
+            git -C "$GITHUB_WORKSPACE/../flux-2-swift-mlx-patched" apply "$p"
+          done
+
       - name: Select newest Xcode
         run: |
           latest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)

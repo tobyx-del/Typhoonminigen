@@ -226,15 +226,17 @@ struct FxSidebar: View {
             }
             .padding(.top, 6).padding(.horizontal, 8).padding(.bottom, 12)
 
-            Text("WORKSPACE")
-                .font(.fx(10.5, weight: .semibold)).tracking(0.7)
-                .foregroundStyle(Color.fxText3)
-                .padding(.top, 10).padding(.horizontal, 9).padding(.bottom, 5)
-
-            VStack(spacing: 2) {
-                ForEach(AppSection.allCases) { item in
-                    NavItem(item: item, isActive: section == item, tail: tail(item)) {
-                        section = item
+            ForEach(Array(AppSection.sidebarGroups.enumerated()), id: \.offset) { _, group in
+                Text(group.title)
+                    .font(.fx(10.5, weight: .semibold)).tracking(0.7)
+                    .foregroundStyle(Color.fxText3)
+                    .padding(.top, 10).padding(.horizontal, 9).padding(.bottom, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(spacing: 2) {
+                    ForEach(group.items) { item in
+                        NavItem(item: item, isActive: section == item, tail: tail(item)) {
+                            section = item
+                        }
                     }
                 }
             }
@@ -298,6 +300,12 @@ struct FxStatusBar<Trailing: View>: View {
     var body: some View {
         HStack(spacing: 0) {
             BuildBadge(version: version)
+            // Only the neutral source link lives in the always-visible footer; the Ko-fi
+            // "support" link stays in the About window + Help, where people go looking for it.
+            FxFooterLink(icon: "chevron.left.forwardslash.chevron.right", label: "GitHub",
+                         url: "https://github.com/abgitdev/Typhoonminigen",
+                         help: "Open the project on GitHub")
+                .padding(.leading, 16)
             Spacer()
             HStack(spacing: 14) { trailing() }
         }
@@ -305,6 +313,33 @@ struct FxStatusBar<Trailing: View>: View {
         .frame(height: 28)
         .background(Color.fxHdrBg)
         .overlay(alignment: .top) { Rectangle().fill(Color.fxHdrBorder).frame(height: 1) }
+    }
+}
+
+/// Small clickable status-bar link (icon + label) → opens a URL in the browser.
+/// Muted like the build tag, amber on hover.
+struct FxFooterLink: View {
+    let icon: String
+    let label: String
+    let url: String
+    let help: String
+    @Environment(\.openURL) private var openURL
+    @State private var hover = false
+
+    var body: some View {
+        Button {
+            if let u = URL(string: url) { openURL(u) }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 10))
+                Text(label).font(.fxMono(11))
+            }
+            .foregroundStyle(hover ? Color.fxAccent : Color.fxHdrMuted)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help(help)
     }
 }
 

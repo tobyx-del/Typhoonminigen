@@ -1,10 +1,32 @@
 import Foundation
+import MLX
 
 /// Result of reading a LoRA's safetensors header (no tensor data loaded).
 struct LoRAInspection: Sendable {
     let tier: ModelTier?
     let note: String
     let trigger: String?   // auto-detected from metadata, if the file stored one
+}
+
+/// Readable failures from the bake / merge weight editing below.
+enum LoRAEditError: LocalizedError {
+    case notALoRA(String)
+    case keyLayoutMismatch
+    case shapeMismatch(String)
+    case nothingToMerge
+
+    var errorDescription: String? {
+        switch self {
+        case .notALoRA(let f):
+            return "\(f) has no lora_B weight tensors — not a standard LoRA."
+        case .keyLayoutMismatch:
+            return "These adapters use different key layouts (BFL vs diffusers naming) — they can't be aligned layer-for-layer. Merge like-formatted adapters only."
+        case .shapeMismatch(let layer):
+            return "Tensor shapes differ at \(layer) — the adapters don't target the same architecture."
+        case .nothingToMerge:
+            return "No LoRA weight pairs were found to merge."
+        }
+    }
 }
 
 /// Reads a `.safetensors` JSON header (8-byte little-endian length + JSON) WITHOUT loading
@@ -24,13 +46,36 @@ enum SafetensorsInspector {
             return LoRAInspection(tier: nil, note: "invalid header", trigger: nil)
         }
         guard let headerData = try? handle.read(upToCount: Int(headerLen)),
-              headerData.count == Int(headerLen),
-              let json = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
+              headerData.count == Int(headerLen) else {
             return LoRAInspection(tier: nil, note: "couldn't parse header", trigger: nil)
         }
+        return inspect(headerData: headerData)
+    }
 
-        let (tier, note) = classify(json)
+    /// Classify from raw safetensors header JSON bytes — same gate as `inspect(at:)`, but the
+    /// header can come from anywhere (the URL importer range-fetches just the header so a
+    /// wrong-architecture file is rejected BEFORE the multi-hundred-MB download).
+    static func inspect(headerData: Data) -> LoRAInspection {
+        guard let json = (try? JSONSerialization.jsonObject(with: headerData)) as? [String: Any] else {
+            return LoRAInspection(tier: nil, note: "couldn't parse header", trigger: nil)
+        }
+        var (tier, note) = classify(json)
+        // Cross-check the ecosystem tier tag (ai-toolkit writes ss_base_model_version =
+        // "flux2_klein_4b"/"flux2_klein_9b"). The block scan stays authoritative; a mismatch
+        // is surfaced in the note so a mislabeled file isn't trusted silently.
+        if let metaTier = metadataTier(json), let scanned = tier, metaTier != scanned {
+            note += " — but its metadata claims \(metaTier.shortName)"
+        }
         return LoRAInspection(tier: tier, note: note, trigger: readTrigger(json))
+    }
+
+    /// Tier recorded in the file's own metadata (ai-toolkit arch names), if any.
+    private static func metadataTier(_ json: [String: Any]) -> ModelTier? {
+        guard let meta = json["__metadata__"] as? [String: Any],
+              let v = (meta["ss_base_model_version"] as? String)?.lowercased() else { return nil }
+        if v.contains("klein_9b") || v.contains("klein-9b") { return .klein9B }
+        if v.contains("klein_4b") || v.contains("klein-4b") { return .klein4B }
+        return nil
     }
 
     /// PRIMARY: classify by the MAX block index across double/single stream blocks. Handles BFL
@@ -122,6 +167,226 @@ enum SafetensorsInspector {
                 if !t.isEmpty, t.lowercased() != "none", t != "[]" { return String(t.prefix(200)) }
             }
         }
+        // ai-toolkit / kohya store it inside ss_tag_frequency — a JSON STRING (safetensors
+        // metadata values must be strings) of {"1_<trigger>": {"<trigger>": count, …}} where
+        // the outer key carries a kohya-style "N_" repeat prefix. Strip the prefix.
+        if let raw = meta["ss_tag_frequency"] as? String,
+           let data = raw.data(using: .utf8),
+           let freq = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let outer = freq.keys.sorted().first {
+            var name = outer
+            if let r = name.range(of: "^\\d+_", options: .regularExpression) {
+                name = String(name[r.upperBound...])
+            }
+            let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty, t.lowercased() != "none" { return String(t.prefix(200)) }
+        }
         return nil
+    }
+
+    // MARK: - Metadata write (publish round-trip)
+
+    /// Copy a `.safetensors` file while MERGING extra string keys into its `__metadata__`, so a
+    /// LoRA published from the in-app trainer carries its trigger + tier in the same ecosystem
+    /// keys ai-toolkit/kohya use — outside this app too (ComfyUI, auto1111, another Mac).
+    /// Existing keys (incl. the engine-consumed lora_alpha/lora_rank) are preserved; `extra` wins
+    /// on collision. Tensor data is streamed through untouched — offsets stay valid because they
+    /// are relative to the data section, not the file start.
+    static func copyAddingMetadata(from src: URL, to dest: URL, extra: [String: String]) throws {
+        let input = try FileHandle(forReadingFrom: src)
+        defer { try? input.close() }
+        guard let lenData = try input.read(upToCount: 8), lenData.count == 8 else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let headerLen = lenData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+        guard headerLen > 0, headerLen < 50_000_000,
+              let headerData = try input.read(upToCount: Int(headerLen)), headerData.count == Int(headerLen),
+              var json = (try? JSONSerialization.jsonObject(with: headerData)) as? [String: Any] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        // Coerce PER KEY, not the whole dict: `as? [String: String]` returns nil the moment a
+        // single value is non-string (tools do write numbers/bools/objects into __metadata__
+        // despite the spec saying strings-only), which silently dropped EVERY existing key —
+        // including the engine-consumed lora_alpha/lora_rank — from the published copy.
+        // Keeping whatever IS a string preserves them; non-string oddballs are the only loss.
+        var meta = ((json["__metadata__"] as? [String: Any]) ?? [:]).compactMapValues { $0 as? String }
+        for (k, v) in extra { meta[k] = v }
+        json["__metadata__"] = meta
+        let newHeader = try JSONSerialization.data(withJSONObject: json)
+
+        FileManager.default.createFile(atPath: dest.path, contents: nil)
+        let output = try FileHandle(forWritingTo: dest)
+        defer { try? output.close() }
+        var newLen = UInt64(newHeader.count).littleEndian
+        try output.write(contentsOf: Data(bytes: &newLen, count: 8))
+        try output.write(contentsOf: newHeader)
+        while let chunk = try input.read(upToCount: 8 << 20), !chunk.isEmpty {   // 8 MB chunks
+            try output.write(contentsOf: chunk)
+        }
+    }
+
+    // MARK: - Weight editing (bake / merge)
+
+    // Pure tensor math on MB-scale adapter files via MLX (CPU stream — the GPU and any loaded
+    // model stay untouched). Both operations write a NEW file and never modify the source.
+    //
+    // Math: the engine's LoRALoader applies deltaW = strength × (lora_alpha/lora_rank) × B·A,
+    // reading alpha/rank from the file's __metadata__ (ratio defaults to 1 when absent). Every
+    // edit here FOLDS the user strength AND the source's alpha/rank ratio into the lora_B
+    // tensors, then declares a neutral ratio (lora_alpha == lora_rank) — so the output is exact
+    // at strength 1.0 in this app and in any other alpha-honoring loader (ComfyUI etc.).
+
+    /// alpha/rank multiplier stored in a file's metadata (1.0 when absent — engine default).
+    private static func alphaOverRank(_ meta: [String: String]) -> Float {
+        guard let a = meta["lora_alpha"].flatMap(Float.init),
+              let r = meta["lora_rank"].flatMap(Float.init), r > 0 else { return 1.0 }
+        return a / r
+    }
+
+    /// Write a copy of `src` whose effect at strength 1.0 equals `src` at `scale` — the
+    /// sweet-spot strength becomes the new neutral. Metadata is carried over, plus a bake tag.
+    /// `async` so the (fast, but file-IO) tensor pass runs off the MainActor.
+    static func bakeStrength(_ scale: Float, from src: URL, to dest: URL) async throws {
+        let (arrays, meta) = try loadArraysAndMetadata(url: src, stream: .cpu)
+        let factor = scale * alphaOverRank(meta)
+        var out: [String: MLXArray] = [:]
+        var ranks: [Int: Int] = [:]           // rank histogram from lora_A shapes
+        var scaledB = 0
+        for (key, arr) in arrays {
+            if key.hasSuffix(".lora_B.weight") {
+                // Compute in float32, store back in the source dtype (bf16 for trained adapters).
+                let f32 = arr.asType(.float32, stream: .cpu)
+                out[key] = multiply(f32, MLXArray(factor), stream: .cpu).asType(arr.dtype, stream: .cpu)
+                scaledB += 1
+            } else {
+                if key.hasSuffix(".lora_A.weight"), let r = arr.shape.first { ranks[r, default: 0] += 1 }
+                out[key] = arr
+            }
+        }
+        guard scaledB > 0 else { throw LoRAEditError.notALoRA(src.lastPathComponent) }
+        var newMeta = meta
+        if let rank = ranks.max(by: { $0.value < $1.value })?.key {
+            newMeta["lora_alpha"] = String(rank)      // neutral ratio — factor already folded into B
+            newMeta["lora_rank"] = String(rank)
+        }
+        newMeta["tm_baked_from"] = src.lastPathComponent
+        newMeta["tm_baked_scale"] = String(format: "%.2f", scale)
+        try saveViaTemp(arrays: out, metadata: newMeta, dest: dest)
+    }
+
+    /// Save to a dot-prefixed temp in the destination folder (invisible to LoRAStore.discover),
+    /// then move into place — a crash/force-quit mid-write must not leave a truncated
+    /// .safetensors registered in the library (its intact leading header would even pass
+    /// inspection and only fail at engine load time).
+    private static func saveViaTemp(arrays: [String: MLXArray], metadata: [String: String], dest: URL) throws {
+        let tmp = dest.deletingLastPathComponent()
+            .appendingPathComponent(".tmp-\(UUID().uuidString)-\(dest.lastPathComponent)")
+        do {
+            try save(arrays: arrays, metadata: metadata, url: tmp, stream: .cpu)
+            if FileManager.default.fileExists(atPath: dest.path) {
+                try FileManager.default.removeItem(at: dest)
+            }
+            try FileManager.default.moveItem(at: tmp, to: dest)
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
+    }
+
+    /// Merge 2+ same-tier adapters into one file at the given per-file strengths — exact
+    /// rank concatenation (deltaW = Σ sᵢ·Bᵢ·Aᵢ = [sᵢ-folded Bᵢ | …]·[Aᵢ / …] stacked along the
+    /// rank axis), so the output rank is the SUM of the source ranks. Layer keys are aligned
+    /// after stripping the loader's known prefixes; caller supplies ecosystem metadata
+    /// (tier tag, trigger). Returns the dominant output rank for the provenance note.
+    static func mergeAdapters(_ sources: [(url: URL, scale: Float)], to dest: URL,
+                              extraMetadata: [String: String]) async throws -> Int {
+        struct Loaded {
+            let name: String
+            let factor: Float                          // user strength × its own alpha/rank
+            var pairs: [String: (a: MLXArray?, b: MLXArray?)] = [:]   // canon path → halves
+            var isBFL = false
+        }
+        var loaded: [Loaded] = []
+        var emitBase: [String: String] = [:]           // canon path → original base path to emit
+        for s in sources {
+            let (arrays, meta) = try loadArraysAndMetadata(url: s.url, stream: .cpu)
+            var l = Loaded(name: s.url.lastPathComponent, factor: s.scale * alphaOverRank(meta))
+            for (key, arr) in arrays {
+                let isA = key.hasSuffix(".lora_A.weight")
+                let isB = key.hasSuffix(".lora_B.weight")
+                guard isA || isB else { continue }     // engine skips non-pair keys; so do we
+                let base = String(key.dropLast(".lora_A.weight".count))   // same length for _B
+                let canon = canonicalLayerPath(base)
+                if l.pairs[canon] == nil { l.pairs[canon] = (nil, nil) }
+                if isA { l.pairs[canon]?.a = arr } else { l.pairs[canon]?.b = arr }
+                if emitBase[canon] == nil { emitBase[canon] = base }
+                if canon.contains("double_blocks.") || canon.contains("single_blocks.") { l.isBFL = true }
+            }
+            guard !l.pairs.isEmpty else { throw LoRAEditError.notALoRA(l.name) }
+            loaded.append(l)
+        }
+        // BFL and diffusers name the SAME layers differently — a mixed merge can't align them
+        // (the engine would remap both onto one module and drop a contribution). Refuse readably.
+        guard Set(loaded.map(\.isBFL)).count == 1 else { throw LoRAEditError.keyLayoutMismatch }
+
+        var out: [String: MLXArray] = [:]
+        var ranks: [Int: Int] = [:]
+        for canon in emitBase.keys.sorted() {
+            var aParts: [MLXArray] = []
+            var bParts: [MLXArray] = []
+            for l in loaded {
+                guard let pair = l.pairs[canon], let a = pair.a, let b = pair.b else { continue }
+                if let first = aParts.first,
+                   first.shape.last != a.shape.last || bParts.first?.shape.first != b.shape.first {
+                    throw LoRAEditError.shapeMismatch(canon)
+                }
+                aParts.append(a.asType(.float32, stream: .cpu))
+                bParts.append(multiply(b.asType(.float32, stream: .cpu), MLXArray(l.factor), stream: .cpu))
+            }
+            guard !aParts.isEmpty, let base = emitBase[canon] else { continue }
+            // A: [rank, in] stacks along axis 0; B: [out, rank] along axis 1. bf16 output
+            // (what trained Klein adapters ship as; ai-toolkit's merge saves bf16 too).
+            let a = concatenated(aParts, axis: 0, stream: .cpu).asType(.bfloat16, stream: .cpu)
+            let b = concatenated(bParts, axis: 1, stream: .cpu).asType(.bfloat16, stream: .cpu)
+            out[base + ".lora_A.weight"] = a
+            out[base + ".lora_B.weight"] = b
+            if let r = a.shape.first { ranks[r, default: 0] += 1 }
+        }
+        guard !out.isEmpty, let rank = ranks.max(by: { $0.value < $1.value })?.key else {
+            throw LoRAEditError.nothingToMerge
+        }
+        var meta = extraMetadata
+        meta["lora_alpha"] = String(rank)              // neutral ratio — strengths folded into B
+        meta["lora_rank"] = String(rank)
+        try saveViaTemp(arrays: out, metadata: meta, dest: dest)
+        return rank
+    }
+
+    /// Strip the prefixes the engine's LoRALoader strips, so files that name the same layer
+    /// "transformer.X", "base_model.model.X" or plain "X" align during a merge.
+    private static func canonicalLayerPath(_ base: String) -> String {
+        var p = base
+        for prefix in ["base_model.model.", "transformer.", "diffusion_model."] where p.hasPrefix(prefix) {
+            p = String(p.dropFirst(prefix.count))
+        }
+        return p
+    }
+
+    /// The ecosystem metadata a published adapter should carry.
+    static func publishMetadata(trigger: String, tier: ModelTier, outputName: String) -> [String: String] {
+        var m: [String: String] = [
+            "ss_base_model_version": tier == .klein9B ? "flux2_klein_9b" : "flux2_klein_4b",
+            "ss_output_name": outputName,
+        ]
+        let t = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty {
+            m["modelspec.trigger_phrase"] = t
+            // Byte-shape ai-toolkit's own ss_tag_frequency ({"1_<trigger>": {"<trigger>": 1}}),
+            // JSON-encoded to a string as safetensors metadata requires.
+            if let data = try? JSONSerialization.data(withJSONObject: ["1_\(t)": [t: 1]]) {
+                m["ss_tag_frequency"] = String(data: data, encoding: .utf8) ?? ""
+            }
+        }
+        return m
     }
 }

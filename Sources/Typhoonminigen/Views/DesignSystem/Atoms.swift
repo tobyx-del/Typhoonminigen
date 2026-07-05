@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // ============================================================
 //  Reusable indicator + control atoms (Dot, Sparkline, Ring,
@@ -261,6 +262,19 @@ struct FxStepper: View {
                 .background(Color.fxHover, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Resolve a dropped provider's file URL via `loadItem`, which vends the raw `file://` bytes.
+/// `loadObject(ofClass: URL.self)` intermittently yields nil for Finder drags (live-tested:
+/// the drop then silently does nothing / the render records no reference path), while the
+/// item-based load reliably returns the URL for an on-disk file. Companion to `FxDropZone`.
+func fxResolveDroppedFileURL(_ provider: NSItemProvider,
+                             completion: @escaping @Sendable (URL?) -> Void) {
+    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+        completion((item as? URL)
+            ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+            ?? (item as? String).flatMap { URL(string: $0) })
     }
 }
 

@@ -18,6 +18,7 @@ enum PNGMetadata {
         width: Int,
         height: Int,
         model: String,
+        quality: String? = nil,
         loras: [(name: String, scale: Float)],
         appVersion: String
     ) -> String {
@@ -26,6 +27,11 @@ enum PNGMetadata {
         tail += ", Seed: \(seed)"
         tail += ", Size: \(width)x\(height)"
         tail += ", Model: \(model)"
+        // Quality rung (QualityPreset.rawValue): it selects the transformer/encoder QUANT, so a
+        // same-seed restore without it renders a DIFFERENT image. Optional + defaulted — old
+        // call sites keep compiling, foreign A1111 readers just ignore the unknown key, and old
+        // PNGs without it restore with the tier default on the read side.
+        if let quality, !quality.isEmpty { tail += ", Quality: \(quality)" }
         if !loras.isEmpty {
             // Quoted because adapter file names may contain commas; quotes/backslashes in
             // a name are escaped; entries join with " / " — a slash can never appear
@@ -137,9 +143,12 @@ enum PNGMetadata {
     struct Recipe {
         var prompt = ""
         var seed: UInt64? = nil
+        var steps: Int? = nil
+        var guidance: Float? = nil
         var width: Int? = nil
         var height: Int? = nil
         var modelName: String? = nil
+        var quality: String? = nil   // QualityPreset.rawValue from our "Quality:" key; nil = old/foreign PNG
         var loras: [(name: String, scale: Float)] = []
         var hadNegativePrompt = false   // foreign A1111 files; Klein has no negative prompt
     }
@@ -164,6 +173,10 @@ enum PNGMetadata {
             switch key.lowercased() {
             case "seed":
                 recipe.seed = UInt64(value)
+            case "steps":
+                recipe.steps = Int(value)
+            case "cfg scale":
+                recipe.guidance = Float(value)
             case "size":
                 let dims = value.lowercased().split(separator: "x")
                 if dims.count == 2, let w = Int(dims[0]), let h = Int(dims[1]) {
@@ -172,6 +185,10 @@ enum PNGMetadata {
                 }
             case "model":
                 recipe.modelName = value
+            case "quality":
+                // Validated against the tier's rungs on the apply side (a foreign/tampered
+                // value must fall back to the tier default, never crash a picker).
+                recipe.quality = value
             case "lora":
                 var list = value
                 if list.hasPrefix("\""), list.hasSuffix("\""), list.count >= 2 {

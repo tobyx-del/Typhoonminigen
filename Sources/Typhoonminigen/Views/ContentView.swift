@@ -9,6 +9,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case gallery
     case models
     case lora
+    case training
     case system
     case help
 
@@ -22,6 +23,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .gallery:  return "Gallery"
         case .models:   return "Models"
         case .lora:     return "LoRA"
+        case .training: return "Training"
         case .system:   return "System"
         case .help:     return "Help"
         }
@@ -35,6 +37,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .gallery:  return "photo.on.rectangle.angled"
         case .models:   return "cube"
         case .lora:     return "point.3.connected.trianglepath.dotted"
+        case .training: return "graduationcap"
         case .system:   return "gauge.with.dots.needle.bottom.50percent"
         case .help:     return "questionmark.circle"
         }
@@ -49,10 +52,21 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .gallery:  return "Browse, remix and drag out earlier renders"
         case .models:   return "Download or import the Klein models"
         case .lora:     return "Import and manage LoRA adapters"
+        case .training: return "Train your own LoRA adapters from a set of images"
         case .system:   return "Telemetry, maintenance and logs"
         case .help:     return "Cheat sheet for every feature — and the welcome tour"
         }
     }
+
+    /// Sidebar nav grouped into labelled sections, in display order. Every case appears exactly
+    /// once — keep these in sync with the cases above.
+    static let sidebarGroups: [(title: String, items: [AppSection])] = [
+        ("CREATE",  [.generate, .queue]),
+        ("BROWSE",  [.gallery, .library]),
+        ("ASSETS",  [.models, .lora, .training]),
+        ("SYSTEM",  [.system]),
+        ("HELP",    [.help]),
+    ]
 }
 
 /// Root window: custom titlebar + sidebar + detail + bottom telemetry status bar.
@@ -61,6 +75,7 @@ struct ContentView: View {
     @Bindable var galleryVM: GalleryViewModel
     @Bindable var modelsVM: ModelsViewModel
     @Bindable var loraVM: LoRAViewModel
+    @Bindable var trainingVM: TrainingViewModel
     @Bindable var systemVM: SystemViewModel
     @Bindable var telemetry: TelemetryService
     @Bindable var sessionStats: SessionStats
@@ -72,6 +87,11 @@ struct ContentView: View {
     @State private var showWhatsNew = false
     @State private var whatsNewSince = "0"   // captured BEFORE marking the version seen
     @State private var updateAvailable: UpdateService.UpdateInfo?
+
+    // UserDefaults keys used from several places below — named once so a typo can't silently
+    // fork the tutorial/What's-New state into two keys.
+    private static let lastSeenWhatsNewVersionKey = "lastSeenWhatsNewVersion"
+    private static let hasSeenTutorialKey = "hasSeenTutorial"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -97,16 +117,16 @@ struct ContentView: View {
             telemetry.start()
             galleryVM.reload()
             loraVM.reload()
-            if !UserDefaults.standard.bool(forKey: "hasSeenTutorial") {
+            if !UserDefaults.standard.bool(forKey: Self.hasSeenTutorialKey) {
                 showTutorial = true
                 // Fresh install: the tour already covers everything — nothing is "new".
-                UserDefaults.standard.set(AppVersion.current, forKey: "lastSeenWhatsNewVersion")
-            } else if UserDefaults.standard.string(forKey: "lastSeenWhatsNewVersion") != AppVersion.current {
-                whatsNewSince = UserDefaults.standard.string(forKey: "lastSeenWhatsNewVersion") ?? "0"
+                UserDefaults.standard.set(AppVersion.current, forKey: Self.lastSeenWhatsNewVersionKey)
+            } else if UserDefaults.standard.string(forKey: Self.lastSeenWhatsNewVersionKey) != AppVersion.current {
+                whatsNewSince = UserDefaults.standard.string(forKey: Self.lastSeenWhatsNewVersionKey) ?? "0"
                 showWhatsNew = true
                 // Mark seen as soon as it's SHOWN — a Cmd-Q before dismissing the sheet used to
                 // leave lastSeen stale and re-show "What's new" on every launch.
-                UserDefaults.standard.set(AppVersion.current, forKey: "lastSeenWhatsNewVersion")
+                UserDefaults.standard.set(AppVersion.current, forKey: Self.lastSeenWhatsNewVersionKey)
             }
             if let info = await UpdateService.checkIfDue() {
                 updateAvailable = info
@@ -116,7 +136,7 @@ struct ContentView: View {
             WhatsNewView(since: whatsNewSince, onClose: { showWhatsNew = false })
         }
         .sheet(isPresented: $showTutorial, onDismiss: {
-            UserDefaults.standard.set(true, forKey: "hasSeenTutorial")
+            UserDefaults.standard.set(true, forKey: Self.hasSeenTutorialKey)
             // The tutorial checkbox may have just opted in to update checks; the
             // service's own guards make this a no-op when it didn't.
             Task {
@@ -180,7 +200,7 @@ struct ContentView: View {
             return m >= 1 ? "rendering · \(pct)% · ~\(m + 1) min left"
                           : "rendering · \(pct)% · \(Int(eta))s left"
         }
-        return generateVM.progress > 0 ? "rendering · \(pct)%" : "warming up…"
+        return generateVM.progress > 0 ? "rendering · \(pct)%" : (generateVM.renderPhase ?? "warming up…")
     }
 
     @ViewBuilder private var detail: some View {
@@ -194,9 +214,18 @@ struct ContentView: View {
         case .gallery:  GalleryView(vm: galleryVM, onRemix: { gen in
                             Task { await generateVM.applyRecipe(gen) }
                             section = .generate
+                        }, onQueueUpscales: { urls, factor in
+                            generateVM.enqueueUpscales(urls, factor: factor)
+                            section = .queue   // show the tasks lining up / running
                         })
         case .models:   ModelsView(vm: modelsVM)
-        case .lora:     LoRAView(vm: loraVM)
+        case .lora:     LoRAView(vm: loraVM, galleryVM: galleryVM,
+                                 onShowRenders: { name in
+                                     galleryVM.clearFilters()
+                                     galleryVM.filterLoRA = name
+                                     section = .gallery
+                                 })
+        case .training: TrainingView(vm: trainingVM)
         case .system:   SystemView(vm: systemVM, stats: sessionStats)
         case .help:     HelpView(onShowTutorial: { showTutorial = true },
                                  onShowWhatsNew: { whatsNewSince = AppVersion.current; showWhatsNew = true })   // show only the current release, not the whole changelog
@@ -211,10 +240,25 @@ struct ContentView: View {
             return generateVM.isBusy ? AnyView(FxDot(tone: .amber, live: true)) : nil
         case .queue:
             let n = generateVM.queue.count
+            if generateVM.queueRunning {
+                return AnyView(HStack(spacing: 5) { FxDot(tone: .amber, live: true); tailText("\(n)") })
+            }
             return n > 0 ? AnyView(tailText("\(n)")) : nil
         case .gallery:
             let n = galleryVM.generations.count
             return n > 0 ? AnyView(tailText("\(n)")) : nil
+        case .training:
+            // A live amber dot while a training OR a caption batch runs (+ any queued count);
+            // just the queued count otherwise. Without the captioning check a 30–60 min VLM
+            // batch showed no live indication anywhere once the workshop editor was closed.
+            let queued = trainingVM.queue.count
+            if trainingVM.activeRunID != nil || trainingVM.captioning {
+                return AnyView(HStack(spacing: 5) {
+                    FxDot(tone: .amber, live: true)
+                    if queued > 0 { tailText("\(queued)") }
+                })
+            }
+            return queued > 0 ? AnyView(tailText("\(queued)")) : nil
         case .system:
             return AnyView(tailText("\(Int(telemetry.snapshot.cpuPercent.rounded()))%"))
         default:
@@ -228,6 +272,15 @@ struct ContentView: View {
     // ── Bottom status bar telemetry (same on every view) ──────────────────────
     @ViewBuilder private var statusTrailing: some View {
         let s = telemetry.snapshot
+        if let warn = telemetry.healthWarning {
+            HStack(spacing: 5) {
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 10))
+                Text(warn)
+            }
+            .font(.fxMono(11)).lineLimit(1)
+            .foregroundStyle(Color.fxDanger)
+            .help("Memory is spilling into swap and the swap file is eating the disk — left unchecked, swap can fill the disk and freeze the machine. Finish or stop the current task, then quit and relaunch the app to release the memory.")
+        }
         FxStat(label: "CPU", value: "\(Int(s.cpuPercent.rounded()))%")
             .help("Live CPU load.")
         FxStat(label: "GPU", value: "\(Int(s.gpuPercent.rounded()))%")

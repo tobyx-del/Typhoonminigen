@@ -26,3 +26,12 @@ enum ByteFormat {
 
     static func string(_ bytes: Int) -> String { string(Int64(bytes)) }
 }
+
+/// Single source for "how much RAM does this Mac have" — the number every gate
+/// (9B training block, generation-area cap) and every label shows. A scattered
+/// `1_073_741_824` literal is how a gate and its explanatory text drift apart.
+enum SystemRAM {
+    static let bytesPerGiB: Int64 = 1_073_741_824
+    /// Installed physical RAM in whole GiB.
+    static var installedGB: Int { Int(ProcessInfo.processInfo.physicalMemory / UInt64(bytesPerGiB)) }
+}

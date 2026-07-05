@@ -10,7 +10,7 @@ import FluxTextEncoders
 /// records, model manager and LoRA matching. The engine supports other variants (Dev),
 /// but the app deliberately exposes only the two Klein tiers — Dev would make Mistral 24B
 /// the text encoder, which cannot fit alongside generation on consumer RAM.
-enum ModelTier: String, CaseIterable, Identifiable, Sendable {
+enum ModelTier: String, CaseIterable, Identifiable, Sendable, Codable {
     case klein4B
     case klein9B
 
@@ -53,44 +53,38 @@ enum ModelTier: String, CaseIterable, Identifiable, Sendable {
     /// Whether downloading needs an HF token (9B is gated; 4B is Apache, tokenless).
     var isGated: Bool { transformerVariant.isGated }
 
-    /// The Qwen3 text encoder the engine pairs with this tier (and that the Models tab
-    /// pre-downloads so the first generation doesn't stall on a silent lazy download).
-    var encoderVariant: Qwen3Variant {
-        switch self {
-        case .klein4B: return .qwen3_4B_8bit
-        case .klein9B: return .qwen3_8B_8bit
-        }
-    }
-
-    /// True when SOME usable Qwen3 encoder for this tier is on disk — the engine accepts
-    /// the 8-bit or 4-bit variant (preferring 8-bit). Mirrors the engine's
-    /// findQwen3ModelPath location ({models}/{org}/{repo}) AND its shard verification:
-    /// config.json alone is NOT proof — an interrupted download leaves config without
-    /// weights (seen live 2026-06-10), and the engine would then lazy-fetch GBs silently.
-    var isEncoderDownloaded: Bool {
+    /// Verifies a Qwen3 encoder is FULLY on disk at {models}/lmstudio-community/{name}. Mirrors the
+    /// engine's findQwen3ModelPath location AND its shard verification: config.json alone is NOT
+    /// proof — an interrupted download leaves config without weights (seen live 2026-06-10), and the
+    /// engine would then lazy-fetch GBs silently.
+    private static func qwenEncoderPresent(_ name: String) -> Bool {
         let fm = FileManager.default
-        let names = self == .klein4B ? ["Qwen3-4B-MLX-8bit", "Qwen3-4B-MLX-4bit"]
-                                     : ["Qwen3-8B-MLX-8bit", "Qwen3-8B-MLX-4bit"]
-        return names.contains { name in
-            let dir = AppPaths.models.appendingPathComponent("lmstudio-community/\(name)", isDirectory: true)
-            guard fm.fileExists(atPath: dir.appendingPathComponent("config.json").path) else { return false }
-            if let data = try? Data(contentsOf: dir.appendingPathComponent("model.safetensors.index.json")),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let map = obj["weight_map"] as? [String: String] {
-                let shards = Set(map.values)
-                return !shards.isEmpty && shards.allSatisfy {
-                    fm.fileExists(atPath: dir.appendingPathComponent($0).path)
-                }
+        let dir = AppPaths.models.appendingPathComponent("lmstudio-community/\(name)", isDirectory: true)
+        guard fm.fileExists(atPath: dir.appendingPathComponent("config.json").path) else { return false }
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("model.safetensors.index.json")),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let map = obj["weight_map"] as? [String: String] {
+            let shards = Set(map.values)
+            return !shards.isEmpty && shards.allSatisfy {
+                fm.fileExists(atPath: dir.appendingPathComponent($0).path)
             }
-            return fm.fileExists(atPath: dir.appendingPathComponent("model.safetensors").path)
         }
+        return fm.fileExists(atPath: dir.appendingPathComponent("model.safetensors").path)
     }
 
-    /// Recommended quantization: qint8 transformer + 8-bit Qwen3 encoder for both tiers.
-    /// (For 4B, .mlx8bit maps to Qwen3-4B-MLX-8bit ~4 GB; the 4-bit sibling ~2 GB is the
-    /// 16 GB-Mac fallback pending the quality A/B — the engine silently prefers whichever
-    /// variant is already on disk, so the shipped default must stay deliberate.)
-    var recommendedQuant: Flux2QuantizationConfig {
-        Flux2QuantizationConfig(textEncoder: .mlx8bit, transformer: .qint8)
+    /// Per-variant on-disk status of this tier's two Qwen3 encoders (8-bit, 4-bit). The engine
+    /// loads whichever is present, PREFERRING 8-bit — so when both are on disk the encoder-only
+    /// quality rungs (Klein 9B Standard vs Best) resolve to the SAME render. Drives the honest 9B
+    /// note on the Generate panel.
+    var encodersOnDisk: (eightBit: Bool, fourBit: Bool) {
+        let names = self == .klein4B ? ("Qwen3-4B-MLX-8bit", "Qwen3-4B-MLX-4bit")
+                                     : ("Qwen3-8B-MLX-8bit", "Qwen3-8B-MLX-4bit")
+        return (Self.qwenEncoderPresent(names.0), Self.qwenEncoderPresent(names.1))
+    }
+
+    /// True when SOME usable Qwen3 encoder for this tier is on disk (the engine accepts 8-bit or 4-bit).
+    var isEncoderDownloaded: Bool {
+        let e = encodersOnDisk
+        return e.eightBit || e.fourBit
     }
 }

@@ -5,6 +5,8 @@ struct GalleryView: View {
     @Bindable var vm: GalleryViewModel
     /// Remix: ContentView loads the record's recipe into the Generate form and switches tabs.
     var onRemix: (Generation) -> Void = { _ in }
+    /// Batch upscale: ContentView enqueues the URLs on the shared queue and shows the Queue tab.
+    var onQueueUpscales: ([URL], Int) -> Void = { _, _ in }
     @State private var confirmDeleteAll = false
     @State private var confirmDeleteSelected = false
 
@@ -42,6 +44,18 @@ struct GalleryView: View {
                     .buttonStyle(FxGhostButtonStyle(height: 30, accentText: false))
                     .disabled(vm.selectedIDs.isEmpty).opacity(vm.selectedIDs.isEmpty ? 0.45 : 1)
                     .help("Copy the selected images to a folder you choose.")
+                    Menu {
+                        Button("Upscale ×2") { queueSelectedUpscales(factor: 2) }
+                        Button("Upscale ×4") { queueSelectedUpscales(factor: 4) }
+                    } label: {
+                        HStack(spacing: 6) { Image(systemName: "arrow.up.left.and.arrow.down.right").font(.system(size: 11)); Text("Upscale") }
+                            .font(.fx(12)).foregroundStyle(Color.fxText2)
+                            .padding(.vertical, 6).padding(.horizontal, 10)
+                    }
+                    .menuStyle(.button).menuIndicator(.hidden).buttonStyle(.plain)
+                    .fixedSize()
+                    .disabled(vm.selectedIDs.isEmpty).opacity(vm.selectedIDs.isEmpty ? 0.45 : 1)
+                    .help("Queue a Real-ESRGAN upscale for every selected image — they run one after another on the Queue tab (each saves a _xN copy next to the original).")
                     Button { confirmDeleteSelected = true } label: {
                         HStack(spacing: 6) { Image(systemName: "trash").font(.system(size: 12)); Text("Delete") }
                     }
@@ -102,13 +116,39 @@ struct GalleryView: View {
                     .padding(.bottom, 12)
             }
 
+            // Action-time refusal from the VM (e.g. delete blocked while an upscale is writing
+            // into the gallery) — the buttons' .disabled(UpscaleService.isBusy) is cosmetic and
+            // can go stale mid-batch, so the VM's gate needs a visible voice here.
+            if let err = vm.errorMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle").font(.system(size: 10))
+                    Text(err)
+                }
+                .font(.fx(11)).foregroundStyle(Color.fxDanger)
+                .padding(.bottom, 12)
+            }
+
+            // ONE visible evaluation per body pass — it's a full filter scan of the store.
+            // The filter bar's "N of M" readout shares it too (it used to run a second full pass).
+            let shown = vm.visible
+
+            if !vm.generations.isEmpty { filterBar(shownCount: shown.count).padding(.bottom, 12) }
+
             if vm.generations.isEmpty {
                 emptyState
+            } else if shown.isEmpty {
+                noMatches
             } else {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 14) {
-                        ForEach(vm.generations) { gen in
-                            GalleryCell(gen: gen, vm: vm, onRemix: onRemix)
+                        ForEach(shown) { gen in
+                            // Selection state is passed in PRECOMPUTED: a cell reading
+                            // vm.selectedIDs itself made every visible cell observation-invalidate
+                            // on each click (one toggle re-rendered the whole grid).
+                            GalleryCell(gen: gen, vm: vm,
+                                        selectionMode: vm.selectionMode,
+                                        isSelected: vm.selectionMode && vm.selectedIDs.contains(gen.id),
+                                        onRemix: onRemix)
                         }
                     }
                     .padding(.bottom, 8)
@@ -122,6 +162,100 @@ struct GalleryView: View {
         .sheet(item: $vm.selected) { gen in
             GenerationDetailView(gen: gen, vm: vm, onRemix: onRemix)
         }
+    }
+
+    /// Hand the selected images to the shared queue as upscale tasks (grid order preserved).
+    private func queueSelectedUpscales(factor: Int) {
+        let urls = vm.visible.filter { vm.selectedIDs.contains($0.id) }.map(\.imageURL)
+        guard !urls.isEmpty else { return }
+        vm.exitSelectionMode()
+        onQueueUpscales(urls, factor)
+    }
+
+    // MARK: Search & filters
+
+    /// `shownCount` = vm.visible.count from the body's single evaluation — do NOT re-read
+    /// vm.visible here (that was a second full filter scan per body pass).
+    private func filterBar(shownCount: Int) -> some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(Color.fxText3)
+                TextField("Search prompt, LoRA or seed…", text: $vm.searchText)
+                    .textFieldStyle(.plain).font(.fx(12)).foregroundStyle(Color.fxText)
+                if !vm.searchText.isEmpty {
+                    Button { vm.searchText = "" } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundStyle(Color.fxText3)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 6).padding(.horizontal, 10).fxInsetField()
+            .frame(maxWidth: 280)
+
+            if vm.tiersPresent.count > 1 {
+                filterMenu(label: "Model",
+                           value: vm.filterTier.flatMap { ModelTier(rawValue: $0)?.shortName ?? $0 },
+                           options: vm.tiersPresent.map { ($0, ModelTier(rawValue: $0)?.shortName ?? $0) },
+                           selection: $vm.filterTier)
+            }
+            if !vm.lorasPresent.isEmpty {
+                filterMenu(label: "LoRA",
+                           value: vm.filterLoRA,
+                           options: vm.lorasPresent.map { ($0, $0) },
+                           selection: $vm.filterLoRA)
+            }
+            if vm.qualitiesPresent.count > 1 {
+                filterMenu(label: "Quality",
+                           value: vm.filterQuality.flatMap { QualityPreset(rawValue: $0)?.label ?? $0 },
+                           options: vm.qualitiesPresent.map { ($0, QualityPreset(rawValue: $0)?.label ?? $0) },
+                           selection: $vm.filterQuality)
+            }
+            if vm.hasActiveFilters {
+                Text("\(shownCount) of \(vm.generations.count)")
+                    .font(.fxMono(10.5)).foregroundStyle(Color.fxAccent)
+                Button("Clear") { vm.clearFilters() }
+                    .buttonStyle(FxGhostButtonStyle(height: 26, accentText: true))
+            }
+            Spacer()
+        }
+    }
+
+    /// One filter chip-menu: "Label · value ⌄" with an "All" reset entry.
+    private func filterMenu(label: String, value: String?,
+                            options: [(raw: String, display: String)],
+                            selection: Binding<String?>) -> some View {
+        Menu {
+            Button("All") { selection.wrappedValue = nil }
+            Divider()
+            ForEach(options, id: \.raw) { opt in
+                Button(opt.display) { selection.wrappedValue = opt.raw }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(label).font(.fx(11)).foregroundStyle(Color.fxText3)
+                Text(value ?? "All").font(.fxMono(11)).foregroundStyle(value == nil ? Color.fxText2 : Color.fxAccent)
+                    .lineLimit(1).frame(maxWidth: 160)
+                Image(systemName: "chevron.down").font(.system(size: 8)).foregroundStyle(Color.fxText3)
+            }
+            .padding(.vertical, 5).padding(.horizontal, 9)
+            .background(Color.fxInset, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.fxBorder, lineWidth: 1))
+        }
+        .menuStyle(.button).menuIndicator(.hidden).buttonStyle(.plain)
+        .fixedSize()
+    }
+
+    private var noMatches: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 32)).foregroundStyle(Color.fxText3.opacity(0.7))
+            Text("No matches").font(.fx(14, weight: .semibold)).foregroundStyle(Color.fxText2)
+            Text("Nothing fits the current search/filters — \(vm.generations.count) image\(vm.generations.count == 1 ? "" : "s") total.")
+                .font(.fx(12)).foregroundStyle(Color.fxText3)
+            Button("Clear filters") { vm.clearFilters() }
+                .buttonStyle(FxSecondaryButtonStyle(height: 30, accentText: true))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var emptyState: some View {
@@ -147,6 +281,11 @@ private func dragProvider(for gen: Generation) -> NSItemProvider {
 private struct GalleryCell: View {
     let gen: Generation
     @Bindable var vm: GalleryViewModel
+    /// Selection state arrives PRECOMPUTED from the grid loop — the cell's body must not read
+    /// vm.selectedIDs / vm.selectionMode (observation would invalidate ALL visible cells per
+    /// click). vm is still used for actions (toggle/delete/thumbnail), which don't observe.
+    let selectionMode: Bool
+    let isSelected: Bool
     var onRemix: (Generation) -> Void
     @State private var thumb: NSImage?
     @State private var loadFailed = false
@@ -202,16 +341,15 @@ private struct GalleryCell: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.fxBorder, lineWidth: 1))
                 .overlay {
-                    if vm.selectionMode {
-                        let isSel = vm.selectedIDs.contains(gen.id)
+                    if selectionMode {
                         ZStack(alignment: .topTrailing) {
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(isSel ? Color.fxAccent.opacity(0.14) : Color.black.opacity(0.05))
+                                .fill(isSelected ? Color.fxAccent.opacity(0.14) : Color.black.opacity(0.05))
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(isSel ? Color.fxAccent : Color.clear, lineWidth: 2.5)
-                            Image(systemName: isSel ? "checkmark.circle.fill" : "circle")
+                                .strokeBorder(isSelected ? Color.fxAccent : Color.clear, lineWidth: 2.5)
+                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                                 .font(.system(size: 18))
-                                .foregroundStyle(isSel ? Color.fxAccent : Color.white.opacity(0.85))
+                                .foregroundStyle(isSelected ? Color.fxAccent : Color.white.opacity(0.85))
                                 .background(Circle().fill(Color.black.opacity(0.4)))
                                 .padding(7)
                         }
@@ -285,14 +423,65 @@ private struct GenerationDetailView: View {
     // Decoded ONCE per sheet — `vm.image(for:)` in body re-read the full-resolution PNG on
     // every body re-evaluation (each status message / hover change).
     @State private var fullImage: NSImage? = nil
+    // Decode came back nil (PNG missing/undecodable) — a definitive broken state mirroring the
+    // grid cell's, instead of the placeholder spinner spinning forever over a nil that will
+    // never resolve.
+    @State private var fullImageMissing = false
+    // Flip-compare: index into referenceImagePaths currently shown instead of the result.
+    @State private var flippedRef: Int? = nil
+    @State private var flippedRefImage: NSImage? = nil
 
     private var createdLine: String {
         let when = gen.createdAt.formatted(date: .abbreviated, time: .shortened)
+        var line = "Created \(when)"
         if let d = gen.durationSeconds {
             let dur = d < 60 ? "\(Int(d.rounded()))s" : "\(Int(d) / 60)m \(Int(d) % 60)s"
-            return "Created \(when) · generated in \(dur)"
+            line += " · generated in \(dur)"
         }
-        return "Created \(when)"
+        if let sps = gen.secondsPerStep { line += String(format: " · %.1f s/step", sps) }
+        if let peak = gen.peakRAMGB { line += String(format: " · peak %.1f GB", peak) }
+        return line
+    }
+
+    /// "Klein 4B · Best · seed … · 1024×1024 · 15 steps · g1.0" — Quality shown when recorded
+    /// (older records have none). Built as a plain String so the optional Quality can be omitted.
+    private func detailLine(_ gen: Generation) -> String {
+        var parts = [ModelTier(rawValue: gen.modelTier)?.shortName ?? gen.modelTier]
+        if let q = gen.quality, let label = QualityPreset(rawValue: q)?.label { parts.append(label) }
+        parts.append("seed \(gen.seed)")
+        parts.append("\(gen.width)×\(gen.height)")
+        parts.append("\(gen.steps) steps")
+        parts.append("g\(String(format: "%.1f", gen.guidance))")
+        if let iter = iterationLabel(gen) { parts.append(iter) }
+        return parts.joined(separator: " · ")
+    }
+
+    /// "iteration 2/5" when this exact prompt has several renders (variations by seed), else nil.
+    /// Position is by creation order (oldest = 1) among same-prompt records in the gallery.
+    private func iterationLabel(_ gen: Generation) -> String? {
+        let siblings = vm.generations.filter { $0.prompt == gen.prompt }
+        guard siblings.count > 1 else { return nil }
+        let ordered = siblings.sorted { $0.createdAt < $1.createdAt }
+        guard let idx = ordered.firstIndex(where: { $0.id == gen.id }) else { return nil }
+        return "iteration \(idx + 1)/\(ordered.count)"
+    }
+
+    /// FluxForge-style large chevron overlaid on the image edge — pages prev/next.
+    /// Hidden at the ends (and while an upscale runs). The bottom ‹ › + arrow keys still work too.
+    @ViewBuilder private func sideNavArrow(isNext: Bool) -> some View {
+        if (isNext ? vm.canSelectNext : vm.canSelectPrevious) && !isUpscaling {
+            Button { isNext ? vm.selectNext() : vm.selectPrevious() } label: {
+                Image(systemName: isNext ? "chevron.right" : "chevron.left")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(.black.opacity(0.45), in: Circle())
+                    .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .padding(10)
+            .help(isNext ? "Next image (→)" : "Previous image (←)")
+        }
     }
 
     // Long prompts (e.g. pasted VLM descriptions) used to grow past the sheet and
@@ -322,6 +511,20 @@ private struct GenerationDetailView: View {
         }
         .buttonStyle(FxGhostButtonStyle(height: 22))
         .help("Copy the full prompt to the clipboard")
+        if let enhanced = gen.enhancedPrompt, !enhanced.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Image(systemName: "sparkles").font(.system(size: 10)).foregroundStyle(Color.fxAccent)
+                    Text("Enhanced prompt — what the model actually saw")
+                        .font(.fx(10.5, weight: .semibold)).foregroundStyle(Color.fxAccent)
+                }
+                Text(enhanced).font(.fx(12)).foregroundStyle(Color.fxText2)
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(Color.fxAccentSoft, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
     }
 
     var body: some View {
@@ -329,12 +532,44 @@ private struct GenerationDetailView: View {
             // Height-capped: an unconstrained portrait image (912×1152 from the aspect
             // chips) used to blow the sheet past the screen and push the buttons out of
             // sight (user screenshots, v0.43).
-            if let img = fullImage {
+            // While a flip is pending (reference still decoding) fall through to the placeholder —
+            // showing the RESULT under a highlighted "showing reference" chip lies for a beat.
+            if let img = (flippedRef != nil ? flippedRefImage : fullImage) {
                 Image(nsImage: img).resizable().scaledToFit()
                     .frame(maxHeight: 470)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .onDrag { dragProvider(for: gen) }
-                    .help("Drag the image out — into Finder, a chat, an editor… The PNG carries the full recipe; drop it back on the canvas later to restore it")
+                    .overlay(alignment: .leading) { sideNavArrow(isNext: false) }
+                    .overlay(alignment: .trailing) { sideNavArrow(isNext: true) }
+                    .overlay(alignment: .bottomLeading) { refFlipStrip }
+                    // Drag exports what's DISPLAYED — the reference file while flipped.
+                    .onDrag {
+                        if let i = flippedRef, let paths = gen.referenceImagePaths, paths.indices.contains(i),
+                           let p = NSItemProvider(contentsOf: URL(fileURLWithPath: paths[i])) {
+                            p.suggestedName = (paths[i] as NSString).lastPathComponent
+                            return p
+                        }
+                        return dragProvider(for: gen)
+                    }
+                    .help(flippedRef == nil
+                          ? "Drag the image out — into Finder, a chat, an editor… The PNG carries the full recipe; drop it back on the canvas later to restore it"
+                          : "Showing the reference — click its thumbnail again for the result. Dragging exports the reference file.")
+            } else if fullImageMissing && flippedRef == nil {
+                // File missing on disk — mirrors the grid cell's broken state (a Finder-deleted
+                // PNG opened from a stale record). Repair Library on the System tab prunes these.
+                Color.fxInset
+                    .frame(height: 470)
+                    .overlay(
+                        VStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle").font(.system(size: 24))
+                            Text("Image file missing").font(.fx(12, weight: .semibold))
+                            Text("The PNG was moved or deleted outside the app — System → Repair Library cleans up such records.")
+                                .font(.fx(10.5)).multilineTextAlignment(.center).frame(maxWidth: 340)
+                        }
+                        .foregroundStyle(Color.fxText2)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(alignment: .leading) { sideNavArrow(isNext: false) }
+                    .overlay(alignment: .trailing) { sideNavArrow(isNext: true) }
             } else {
                 Color.fxInset
                     .frame(height: 470)
@@ -346,7 +581,7 @@ private struct GenerationDetailView: View {
                 // String(seed): Text's number interpolation adds locale commas, which the Seed
                 // field couldn't parse back. Selectable so the seed can be copied for a re-run.
                 // Prettify the stored rawValue ("klein4B" → "Klein 4B"); unknown legacy strings display as-is.
-                Text("\(ModelTier(rawValue: gen.modelTier)?.shortName ?? gen.modelTier) · seed \(String(gen.seed)) · \(gen.width)×\(gen.height) · \(gen.steps) steps · g\(gen.guidance, specifier: "%.1f")")
+                Text(detailLine(gen))
                     .font(.fxMono(11)).foregroundStyle(Color.fxText3)
                     .textSelection(.enabled)
                 Text(createdLine).font(.fxMono(10.5)).foregroundStyle(Color.fxText3)
@@ -433,14 +668,76 @@ private struct GenerationDetailView: View {
         .frame(width: 680)
         .frame(minHeight: 540)
         .background(Color.fxBg)
+        // Synchronous per-record reset (same transaction as the ‹ › step) — the async .task
+        // variant painted the PREVIOUS record's reference/result for a frame under the NEW
+        // record's metadata. onChange doesn't fire on first presentation; initial state is nil anyway.
+        .onChange(of: gen.id) {
+            upscaleMessage = nil
+            fullImage = nil
+            fullImageMissing = false   // the neighbour may exist even if this one didn't
+            flippedRef = nil
+            flippedRefImage = nil
+        }
         .task(id: gen.id) {
-            upscaleMessage = nil   // don't carry the previous image's status across ‹ ›
-            fullImage = nil        // placeholder instead of the PREVIOUS image under new metadata
             let img = await vm.image(for: gen)
             // ‹ › may have moved on while this decoded — a stale result must not paint the
             // WRONG image under the new record's metadata.
             guard !Task.isCancelled else { return }
             fullImage = img
+            fullImageMissing = (img == nil)   // nil never resolves — show broken, not an eternal spinner
+        }
+        .task(id: flippedRef) {
+            flippedRefImage = nil   // an A→B flip must not show A's image under B's highlight
+            guard let i = flippedRef, let paths = gen.referenceImagePaths, paths.indices.contains(i) else { return }
+            let url = URL(fileURLWithPath: paths[i])
+            let img = await Task.detached(priority: .userInitiated) { NSImage(contentsOf: url) }.value
+            guard !Task.isCancelled else { return }
+            flippedRefImage = img
+            if img == nil { upscaleMessage = "Reference not found — the file was moved or deleted." ; flippedRef = nil }
+        }
+    }
+
+    /// Flip-compare strip on the detail image: one thumb per recorded I2I reference — click to
+    /// show the reference IN PLACE of the result, click again to return. Paths are informational
+    /// and may be stale; a missing file reports instead of flipping.
+    @ViewBuilder private var refFlipStrip: some View {
+        if let paths = gen.referenceImagePaths, !paths.isEmpty {
+            HStack(spacing: 6) {
+                ForEach(Array(paths.enumerated()), id: \.offset) { i, path in
+                    Button {
+                        flippedRef = (flippedRef == i) ? nil : i
+                    } label: {
+                        RefThumb(url: URL(fileURLWithPath: path))
+                            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .strokeBorder(flippedRef == i ? Color.fxAccent : Color.white.opacity(0.35),
+                                              lineWidth: flippedRef == i ? 2 : 1))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Flip between this reference and the result in place — judge whether the fine identity survived.")
+                }
+                if flippedRef != nil {
+                    Text("showing reference")
+                        .font(.fxMono(9.5)).foregroundStyle(Color.fxText)
+                        .fxChip(padV: 3, padH: 8)
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    /// Small reference thumbnail loaded off-main (paths can point outside the app's folders).
+    private struct RefThumb: View {
+        let url: URL
+        @State private var image: NSImage?
+        var body: some View {
+            Rectangle().fill(Color.fxInset)
+                .frame(width: 36, height: 36)
+                .overlay {
+                    if let image { Image(nsImage: image).resizable().scaledToFill() }
+                    else { Image(systemName: "photo").font(.system(size: 10)).foregroundStyle(Color.fxText3) }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .task(id: url) { image = await WorkshopDatasetService.thumbnail(at: url, maxPixel: 96) }
         }
     }
 

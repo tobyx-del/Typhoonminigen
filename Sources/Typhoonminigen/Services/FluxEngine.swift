@@ -5,6 +5,14 @@ import MLX
 
 /// Everything needed for one text-to-image generation. Sendable so it can cross
 /// the actor boundary.
+/// Output of one generation: the image plus the prompt the engine ACTUALLY used. `usedPrompt`
+/// is set only when "Enhance prompt" rewrote it (so the gallery can reveal the rewrite); nil
+/// otherwise (no enhancement happened, or I2I where enhancement is disabled).
+struct GenerationOutput: Sendable {
+    let image: CGImage
+    let usedPrompt: String?
+}
+
 struct GenerationRequest: Sendable {
     var prompt: String
     var tier: ModelTier
@@ -14,12 +22,22 @@ struct GenerationRequest: Sendable {
     var steps: Int
     var guidance: Float
     var seed: UInt64?
-    /// LoRAs to fuse, in slot order (≤2 by app policy; deltas sum, so order is cosmetic).
+    /// LoRAs to fuse, in list order (no count cap; deltas sum, so order is cosmetic).
     var loras: [LoRAUse] = []
     var upsamplePrompt: Bool = false
+    /// The render-quality preset's rawValue (for the gallery record / Details). nil = old/unset.
+    var quality: String? = nil
     // I2I metadata (paths stored in the gallery record; actual CGImages passed separately
-    // to generate()). Up to 3 references — the engine pipeline rejects more.
+    // to generate()). Up to 4 references — we call generate(mode:) directly (the
+    // generateImageToImage convenience wrapper caps at 3; the model spec allows 4).
     var referenceImagePaths: [String]? = nil
+
+    /// The transformer file this request's quant resolves to — used to gate the download
+    /// (a queued item carries its own baked quant, so derive the variant from THAT, not the
+    /// tier default, or a "Best/bf16" item would be checked against the qint8 file).
+    var transformerVariant: ModelRegistry.TransformerVariant {
+        ModelRegistry.TransformerVariant.variant(for: tier.flux2Model, quantization: quant.transformer)
+    }
 }
 
 enum FluxEngineError: LocalizedError {
@@ -79,15 +97,27 @@ actor FluxEngine {
     /// a Describe launched mid-unload would load the VLM into the process-global MLX pool that
     /// clearAll() is gutting → crash / garbage. This closes the unload→Describe "third door" the
     /// UI gate can't see (a freeMemory()/Clear-cache from ANY tab sets no VM flag the button reads).
+    ///
+    /// The claim is EXCLUSIVE: it also refuses while `describing` is already latched. The latch is
+    /// a single Bool (no refcount) shared by Describe/Ask/Compare, the trainer and caption jobs —
+    /// a second claimant would (a) run its VLM/trainer work concurrently with the current holder
+    /// on the shared MLX pool, and (b) release the latch the FIRST holder set at its own task
+    /// tail, letting generate()/freeMemory() gut the pool under still-running work.
     @discardableResult
     func setDescribing(_ value: Bool) -> Bool {
         if value {
-            guard !busy else { return false }
+            guard !busy, !describing else { return false }
             describing = true
             return true
         }
         describing = false
         return true
+    }
+
+    /// Whether the RESIDENT pipeline already matches a request (tier AND quant) — the honest
+    /// "will generate() start stepping right away or load weights first" signal for telemetry.
+    func isResident(tier: ModelTier, quant: Flux2QuantizationConfig) -> Bool {
+        pipeline != nil && loadedTier == tier && sameQuant(loadedQuant, quant)
     }
 
     // MARK: Loading / tier switching
@@ -130,13 +160,13 @@ actor FluxEngine {
     func generate(
         _ req: GenerationRequest,
         hfToken: String?,
-        referenceImages: [CGImage] = [],   // empty → T2I; 1–3 → I2I (passed separately to keep GenerationRequest Sendable)
+        referenceImages: [CGImage] = [],   // empty → T2I; 1–4 → I2I (passed separately to keep GenerationRequest Sendable)
         onDownload: @escaping @Sendable (Double, String) -> Void = { _, _ in },
         onStep: @escaping @Sendable (Int, Int) -> Void = { _, _ in },
         previewEachStep: Bool = false,   // live preview: VAE-decode + onCheckpoint at a checkpoint interval
         previewEveryStep: Bool = false,  // when previewEachStep: decode EVERY step (interval 1) vs once at ~75%
         onCheckpoint: @escaping @Sendable (Int, CGImage) -> Void = { _, _ in }
-    ) async throws -> CGImage {
+    ) async throws -> GenerationOutput {
         // Block while a VLM Describe holds the process-global MLX pool too — the Queue "Run all"
         // path isn't UI-gated against describe, and running a denoise/VAE-decode (or a tier-switch
         // tearDown→clearCache) on the pool the VLM is using corrupts buffers / SIGABRTs.
@@ -155,12 +185,12 @@ actor FluxEngine {
         // Hard memory floor (belt-and-braces — the VM clamps too): on <16 GB the GPU aborts
         // (mlx::core::gpu::check_error throw → SIGABRT) above ~0.8 MP. Clamp so NO path
         // (queue, inline-edited task, restored recipe) can OOM-crash the app.
-        let maxArea = ModelRegistry.systemRAMGB < 16 ? 820_000 : 2_359_296
+        let maxArea = ReferenceSize.maxArea(forInstalledGB: SystemRAM.installedGB)
         if req.width > 0, req.height > 0, req.width * req.height > maxArea {
             let s = (Double(maxArea) / Double(req.width * req.height)).squareRoot()
             let cw = max(512, min(1536, Int((Double(req.width) * s / 32).rounded(.down)) * 32))
             let ch = max(512, min(1536, Int((Double(req.height) * s / 32).rounded(.down)) * 32))
-            AppLog.info("Size capped for \(ModelRegistry.systemRAMGB) GB RAM: \(req.width)×\(req.height) → \(cw)×\(ch)")
+            AppLog.info("Size capped for \(SystemRAM.installedGB) GB RAM: \(req.width)×\(req.height) → \(cw)×\(ch)")
             req.width = cw
             req.height = ch
         }
@@ -229,11 +259,16 @@ actor FluxEngine {
             ? { @Sendable step, img in onCheckpoint(step, Self.displayNormalized(img)) }
             : nil
 
-        let result: CGImage
         if !referenceImages.isEmpty {
-            result = try await pipeline.generateImageToImage(
+            // Call the lower-level generate(mode:) directly instead of generateImageToImage():
+            // the convenience wrapper hard-caps refs at 3 (`guard images.count <= 3`), but the
+            // model spec is 4 (Flux2Config.maxReferenceImages == 4) and this public path has NO
+            // such guard — it routes straight to the per-image reference encoder. interpretImagePaths
+            // stays nil here too (Mistral fuse; the tripwire checks it at both call sites).
+            // Upsampling is forced off for I2I above, so there is no enhanced prompt to reveal.
+            let result = try await pipeline.generate(
+                mode: .imageToImage(images: referenceImages),
                 prompt: req.prompt,
-                images: referenceImages,
                 interpretImagePaths: nil,
                 height: req.height,
                 width: req.width,
@@ -245,8 +280,13 @@ actor FluxEngine {
                 onProgress: onStep,
                 onCheckpoint: checkpointCallback
             )
+            return GenerationOutput(image: Self.displayNormalized(result), usedPrompt: nil)
         } else {
-            result = try await pipeline.generateTextToImage(
+            // T2I via the *WithResult* variant: identical params to generateTextToImage (a nil
+            // image-interpret path — the Mistral fuse, kept at both call sites), so the image is
+            // produced exactly the same way. It additionally returns the prompt the engine actually
+            // used, so the UI can REVEAL what "Enhance prompt" rewrote it to.
+            let r = try await pipeline.generateTextToImageWithResult(
                 prompt: req.prompt,
                 interpretImagePaths: nil,
                 height: req.height,
@@ -259,8 +299,10 @@ actor FluxEngine {
                 onProgress: onStep,
                 onCheckpoint: checkpointCallback
             )
+            let enhanced = (r.wasUpsampled && !r.usedPrompt.isEmpty && r.usedPrompt != r.originalPrompt)
+                ? r.usedPrompt : nil
+            return GenerationOutput(image: Self.displayNormalized(r.image), usedPrompt: enhanced)
         }
-        return Self.displayNormalized(result)
     }
 
     /// Re-render the engine's CGImage into the standard 32-bit premultiplied RGBA format.

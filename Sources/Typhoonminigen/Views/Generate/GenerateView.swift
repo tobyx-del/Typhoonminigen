@@ -21,9 +21,12 @@ struct GenerateView: View {
     @AppStorage("panelsCollapsed") private var panelsCollapsed = false   // #7 hide the panels under the prompt
     @State private var resultZoom: CGFloat = 1        // #14 scroll-wheel zoom of the result preview
     @State private var resultPan: CGSize = .zero      // #14 pan offset that keeps the point under the cursor fixed
+    @State private var flippedRefID: UUID? = nil      // flip-compare: showing this reference (by IDENTITY — indexes shift when refs are removed) instead of the result
     @State private var resultImageFrame: CGRect = .zero  // the fitted (unscaled) image rect, global coords
     @State private var canvasFrame: CGRect = .zero    // canvas bounds in global coords, for the scroll monitor
+    @State private var aiQuestion = ""   // "Ask AI about this image" field
     @State private var scrollMonitor: Any? = nil
+    @State private var saveCardDraft: SceneRecipe?   // "Save as card" → the card editor sheet
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -48,7 +51,11 @@ struct GenerateView: View {
         .background(Color.fxBg)
         .onAppear { installScrollZoom() }
         .onDisappear { if let m = scrollMonitor { NSEvent.removeMonitor(m); scrollMonitor = nil } }
-        .onChange(of: vm.isBusy) { _, busy in if busy { resultZoom = 1; resultPan = .zero } }   // a new render resets zoom
+        .onChange(of: vm.isBusy) { _, busy in if busy { resultZoom = 1; resultPan = .zero; flippedRefID = nil } }   // a new render resets zoom + flip
+        // Removing/replacing references while flipped must not silently swap WHICH image shows.
+        .onChange(of: vm.references.map(\.id)) { _, ids in
+            if let id = flippedRefID, !ids.contains(id) { flippedRefID = nil }
+        }
         .task {
             await vm.syncModelState()
             vm.reloadLoRAs()
@@ -70,11 +77,74 @@ struct GenerateView: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
             }
             footer
+            if vm.resultImage != nil {
+                aiInsightsCard
+                    .transition(.opacity)
+            }
         }
         // #5 belt-and-suspenders: also animate the panel show/hide off the panelsCollapsed VALUE,
         // so the collapse transitions fire even if the @AppStorage write-back lands in a separate
         // (un-animated) transaction from the chevron's withAnimation — it never silently pops.
         .animation(.easeInOut(duration: 0.18), value: panelsCollapsed)
+    }
+
+    /// Local VLM tools on the latest result: ask a free-form question, or score it against the
+    /// reference. Shown only after a render; shares the Describe VLM (~3 GB) + busy state.
+    private var aiInsightsCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles").font(.system(size: 12)).foregroundStyle(Color.fxAccent)
+                Text("AI insights").font(.fx(13, weight: .bold)).foregroundStyle(Color.fxText)
+                Spacer(minLength: 6)
+                if vm.isDescribing {
+                    Button("Cancel") { vm.cancelDescribe() }
+                        .buttonStyle(FxGhostButtonStyle(height: 24, accentText: true))
+                }
+            }
+            Text("Ask the local vision model about this image, or score how close it is to your reference. Uses the same Qwen3.5-VLM as Describe (~3 GB) — local, one at a time.")
+                .font(.fx(11)).foregroundStyle(Color.fxText3).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                TextField("Ask anything about this image…", text: $aiQuestion)
+                    .textFieldStyle(.plain).font(.fx(12.5)).foregroundStyle(Color.fxText)
+                    .padding(.vertical, 8).padding(.horizontal, 12).fxInsetField(radius: 9)
+                    .onSubmit { vm.askAboutImage(aiQuestion) }
+                Button { vm.askAboutImage(aiQuestion) } label: { Text("Ask") }
+                    .buttonStyle(FxPrimaryButtonStyle(height: 30))
+                    .disabled(vm.isDescribing || vm.isBusy || vm.queueRunning
+                              || aiQuestion.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .help("Ask the local Qwen3.5 vision model anything about this image — the answer appears below. Runs on this Mac; disabled while a render or queue is going.")
+            }
+            if let answer = vm.vlmAnswer {
+                Text(answer).font(.fx(12)).foregroundStyle(Color.fxText2).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                    .background(Color.fxInset, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            if !vm.references.isEmpty {
+                Button { vm.compareToReference() } label: {
+                    HStack(spacing: 6) { Image(systemName: "scalemass"); Text("Compare to reference") }
+                }
+                .buttonStyle(FxSecondaryButtonStyle(height: 30, accentText: true))
+                .disabled(vm.isDescribing || vm.isBusy || vm.queueRunning)
+                .help("Score how closely this result matches your first reference image (scene + style, 0–10).")
+                if let c = vm.vlmComparison {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 14) {
+                            Text("Scene \(c.sceneScore)/10").font(.fxMono(12)).foregroundStyle(Color.fxAccent)
+                            Text("Style \(c.styleScore)/10").font(.fxMono(12)).foregroundStyle(Color.fxAccent)
+                        }
+                        Text(c.sceneReason).font(.fx(11)).foregroundStyle(Color.fxText3)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(c.styleReason).font(.fx(11)).foregroundStyle(Color.fxText3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                    .background(Color.fxInset, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fxCard()
     }
 
     private var modelStatusText: String {
@@ -105,6 +175,28 @@ struct GenerateView: View {
             HStack(spacing: 6) {
                 ForEach(ModelTier.allCases) { t in
                     tierChip(t)
+                }
+                Spacer(minLength: 8)
+                qualityMenu
+            }
+            // Active quant combo (mirrors Fluxforge's "Qwen3 4B · LLM: 8-bit · Diffuser: …").
+            HStack(spacing: 6) {
+                Image(systemName: "cpu").font(.system(size: 10)).foregroundStyle(Color.fxText3)
+                Text(vm.tier.qualitySummary(for: vm.quality))
+                    .font(.fxMono(10.5)).foregroundStyle(Color.fxText3)
+            }
+            if let note = nineBEncoderNote {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "info.circle").font(.system(size: 10)).foregroundStyle(Color.fxText3)
+                    Text(note).font(.fx(10.5)).foregroundStyle(Color.fxText3)
+                        .fixedSize(horizontal: false, vertical: true).lineSpacing(1.5)
+                }
+            }
+            if let hint = vm.qualityDownloadHint {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "arrow.down.circle").font(.system(size: 11)).foregroundStyle(.orange)
+                    Text(hint).font(.fx(11)).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Text(tierBlurb)
@@ -137,6 +229,27 @@ struct GenerateView: View {
         }
     }
 
+    /// Honest clarification for Klein 9B: both quality rungs run the SAME Full bf16 image model and
+    /// differ ONLY in the Qwen3-8B text-encoder precision — and the engine loads whichever encoder is
+    /// on disk (preferring 8-bit). So when both encoders are present, Standard and Best produce the
+    /// identical render. nil for 4B, or for 9B when nothing is downloaded yet (the orange download
+    /// hint covers that case). Reads the VM's CACHED flags (refreshed by syncModelState) — the live
+    /// encodersOnDisk probe parses the safetensors index + stats every shard, and this body
+    /// re-evaluates on every telemetry tick / keystroke.
+    private var nineBEncoderNote: String? {
+        guard vm.tier == .klein9B else { return nil }
+        switch (vm.nineBEncoder8BitOnDisk, vm.nineBEncoder4BitOnDisk) {
+        case (true, true):
+            return "Both 9B rungs run the same Full bf16 image model — they differ only in the text encoder. Both Qwen3-8B encoders are on disk and the engine prefers 8-bit, so Standard and Best currently render identically."
+        case (true, false):
+            return "9B loads the 8-bit text encoder (on disk). The Standard/Best rung only changes the encoder precision — the bf16 image model is identical either way."
+        case (false, true):
+            return "9B loads the 4-bit text encoder (on disk). The Standard/Best rung only changes the encoder precision — the bf16 image model is identical either way."
+        case (false, false):
+            return nil
+        }
+    }
+
     /// Tier selector chip. Disabled while generating: queued items keep their snapshotted
     /// tier anyway, and mid-run switches would only desync the status pill.
     private func tierChip(_ t: ModelTier) -> some View {
@@ -157,6 +270,35 @@ struct GenerateView: View {
         .help(t == .klein4B
               ? "Light model: ~8 GB disk total, no HuggingFace token, Apache 2.0"
               : "Quality model: ~26 GB disk total, needs a HuggingFace token (gated)")
+    }
+
+    /// Quality (quantization) preset dropdown — Fluxforge parity: 4B shows 4 rungs, 9B shows 2.
+    private var qualityMenu: some View {
+        Menu {
+            ForEach(vm.tier.qualityPresets) { q in
+                Button {
+                    vm.quality = q
+                } label: {
+                    if vm.quality == q { Label(q.label, systemImage: "checkmark") }
+                    else { Text(q.label) }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text("Quality").font(.fx(11)).foregroundStyle(Color.fxText3)
+                Text(vm.quality.label).font(.fxMono(11.5)).foregroundStyle(Color.fxAccent)
+                Image(systemName: "chevron.down").font(.system(size: 9)).foregroundStyle(Color.fxText3)
+            }
+            .padding(.vertical, 5).padding(.horizontal, 10)
+            .background(Color.fxInset, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.fxBorder, lineWidth: 1))
+        }
+        .menuStyle(.button).menuIndicator(.hidden).buttonStyle(.plain)
+        .fixedSize()
+        // NOT disabled during a render: quality only affects the NEXT enqueued render (the running
+        // one keeps its baked quant), so the user can line up a different quality while one renders.
+        .help("Render quality = quantization preset. Higher = sharper but more RAM/time and a bigger download. The transformer precision (8-bit qint8 → Full bf16) is the main lever; the encoder rung is finer. Klein 4B has 4 rungs, Klein 9B has 2.")
     }
 
     private var promptCard: some View {
@@ -200,7 +342,7 @@ struct GenerateView: View {
                     .frame(minHeight: panelsCollapsed ? 340 : 120)
             }
             .fxInsetField(radius: 10)
-            .help("Describe the image in any language. Selected preset phrases and LoRA trigger words are appended automatically at generation — you only write the subject.")
+            .help("Describe the image in any language. Selected preset phrases and LoRA trigger words are appended automatically at generation — you only write the subject. To place a trigger word mid-sentence instead, type [trigger] where it should go ([trigger:2] = second LoRA in the list).")
         }
         .fxCard()
     }
@@ -232,6 +374,7 @@ struct GenerateView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            stepsRow
             HStack(alignment: .top, spacing: 10) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Seed").fxLabel()
@@ -244,8 +387,13 @@ struct GenerateView: View {
                         .help("Empty = a new random seed every render. Paste a seed from the Gallery to reproduce an image exactly; a batch counts up from it.")
                 }
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("LoRA").fxLabel()
-                    loraMenu(0)
+                    HStack(spacing: 6) {
+                        Text("LoRA").fxLabel()
+                        if !vm.loraSlots.isEmpty {
+                            Text("· \(vm.loraSlots.count)").font(.fxMono(10)).foregroundStyle(Color.fxAccent)
+                        }
+                    }
+                    addLoRAMenu
                     if vm.availableLoRAs.isEmpty, let other = vm.loRAsForOtherTier.first?.tier?.shortName {
                         let n = vm.loRAsForOtherTier.count
                         Text("You have \(n) adapter\(n == 1 ? "" : "s") for \(other). Switch the model to \(other) on the Models tab to use \(n == 1 ? "it" : "them").")
@@ -254,17 +402,19 @@ struct GenerateView: View {
                     }
                 }
             }
-            if vm.loraSlots[0].item != nil {
-                loraSlotDetails(0)
-                // Second slot appears once the first is in use — the engine fuses both
-                // and their effects combine (e.g. a style LoRA + a subject LoRA).
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("LoRA 2 (optional — effects combine)").fxLabel()
-                    loraMenu(1)
+            // Added adapters — unlimited; each fuses into the next render, effects combine.
+            ForEach(vm.loraSlots) { slot in
+                loraRow(slot)
+            }
+            if !vm.loraSlots.isEmpty {
+                Button { vm.clearAllLoRAs() } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "xmark.circle").font(.system(size: 10))
+                        Text("Remove all LoRAs")
+                    }.font(.fx(11))
                 }
-                if vm.loraSlots[1].item != nil {
-                    loraSlotDetails(1)
-                }
+                .buttonStyle(.plain).foregroundStyle(Color.fxText3)
+                .help("Clear the whole LoRA list")
             }
             if vm.upsamplePrompt, !vm.isI2IMode, vm.activeLoRASlots.contains(where: { $0.item?.trigger.isEmpty == false }) {
                 Text("Qwen3 may rephrase the LoRA trigger — check the result.")
@@ -276,27 +426,37 @@ struct GenerateView: View {
 
     /// One-tap output formats — every chip lands on Klein's ~1 MP sweet spot, so the user
     /// never hand-dials a quality-degrading size; the ⇄ button flips portrait/landscape.
+    /// Two rows (4 + 3) so all 7 presets fit the narrow panel without the labels wrapping.
     private var aspectRow: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        let chips = GenerateViewModel.aspectChips
+        let topRow = Array(chips.prefix(4))
+        let bottomRow = Array(chips.dropFirst(4))
+        // 4-column grid: chips stretch to fill each column so the row reads evenly (no left clump).
+        return VStack(alignment: .leading, spacing: 6) {
             Text("Aspect").fxLabel()
             HStack(spacing: 6) {
-                ForEach(GenerateViewModel.aspectChips, id: \.label) { chip in
-                    aspectChip(chip)
-                }
-                Spacer(minLength: 0)
-                Button { vm.swapOrientation() } label: {
-                    Image(systemName: "arrow.left.arrow.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(Color.fxText2)
-                        .padding(.vertical, 6).padding(.horizontal, 9)
-                        .background(Color.fxInset, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(Color.fxBorder, lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-                .help("Swap width and height (portrait ↔ landscape)")
+                ForEach(topRow, id: \.label) { aspectChip($0) }
+            }
+            HStack(spacing: 6) {
+                ForEach(bottomRow, id: \.label) { aspectChip($0) }
+                swapButton
             }
         }
+    }
+
+    private var swapButton: some View {
+        Button { vm.swapOrientation() } label: {
+            Image(systemName: "arrow.left.arrow.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.fxText2)
+                .padding(.vertical, 6).padding(.horizontal, 9)
+                .frame(maxWidth: .infinity)
+                .background(Color.fxInset, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.fxBorder, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help("Swap width and height (portrait ↔ landscape)")
     }
 
     private func aspectChip(_ chip: (label: String, w: Int, h: Int)) -> some View {
@@ -305,29 +465,62 @@ struct GenerateView: View {
         return Button { vm.applyAspect(chip.w, chip.h) } label: {
             Text(chip.label)
                 .font(.fxMono(11))
+                .lineLimit(1)
                 .foregroundStyle(active ? Color.fxOnAccent : Color.fxText2)
                 .padding(.vertical, 5).padding(.horizontal, 10)
+                .frame(maxWidth: .infinity)
                 .background(active ? Color.fxAccent : Color.fxInset,
                             in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .strokeBorder(active ? Color.fxAccent : Color.fxBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
-        .help("\(size.width)×\(size.height)\(chip.w == chip.h ? "" : (chip.w < chip.h ? " — portrait" : " — landscape")) · ⇄ flips it · all chips target Klein's ~1 MP sweet spot")
+        .help("\(GenerateViewModel.aspectName(chip.w, chip.h)) · \(size.width)×\(size.height) · ⇄ flips it · targets Klein's ~1 MP sweet spot")
     }
 
-    private func loraMenu(_ index: Int) -> some View {
-        // The other slot's selection is excluded — fusing the same file twice doubles it.
-        let otherID = vm.loraSlots[1 - index].item?.id
+    /// Denoising-steps slider. Klein's distilled sweet spot is 4, but the engine takes ANY
+    /// count with no reload — more steps refine longer (user-verified live: 9B at 50 steps).
+    private var stepsRow: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text("Steps").fxLabel()
+                Spacer(minLength: 0)
+                Text("\(vm.steps)").font(.fxMono(12)).foregroundStyle(Color.fxText)
+                if vm.steps != vm.tier.defaultSteps {
+                    Button { vm.steps = vm.tier.defaultSteps } label: {
+                        Text("reset \(vm.tier.defaultSteps)").font(.fxMono(10))
+                    }
+                    .buttonStyle(.plain).foregroundStyle(Color.fxAccent)
+                    .help("Back to Klein's distilled default (\(vm.tier.defaultSteps))")
+                } else {
+                    Text("default").font(.fxMono(10)).foregroundStyle(Color.fxText3)
+                }
+            }
+            Slider(value: Binding(get: { Double(vm.steps) },
+                                  set: { vm.steps = Int($0.rounded()) }),
+                   in: 1...Double(GenerateViewModel.maxSteps), step: 1)
+                .tint(.fxAccent)
+            HStack {
+                Text("Fast").font(.fx(10)).foregroundStyle(Color.fxText3)
+                Spacer()
+                Text("Quality").font(.fx(10)).foregroundStyle(Color.fxText3)
+            }
+        }
+        .help("Denoising steps. Klein is distilled — 4 is its sweet spot (diminishing returns above). More steps refine detail but take proportionally longer, and the model is NOT reloaded — only the render runs longer (e.g. Klein 9B ≈ 33 s/step → 20 steps ≈ 11 min).")
+    }
+
+    /// "Add LoRA" dropdown — lists every compatible adapter not already in the list. Picking one
+    /// appends a row. Unlimited (Fluxforge-style); the engine fuses any number with flat RAM.
+    private var addLoRAMenu: some View {
+        let addedIDs = Set(vm.loraSlots.compactMap { $0.item?.id })
+        let selectable = vm.availableLoRAs.filter { !addedIDs.contains($0.id) }
         return Menu {
-            Button(index == 0 ? "No LoRA" : "None") { vm.clearLoRASlot(index) }
-            ForEach(vm.availableLoRAs.filter { $0.id != otherID }) { lora in
-                Button(lora.fileName) { vm.loraSlots[index].item = lora }
+            ForEach(selectable) { lora in
+                Button(lora.fileName) { vm.addLoRA(lora) }
             }
         } label: {
             HStack {
-                Text(vm.loraSlots[index].item?.fileName ?? (index == 0 ? "No LoRA" : "None"))
-                    .font(.fx(12.5)).foregroundStyle(Color.fxText).lineLimit(1)
+                Text("Add LoRA").font(.fx(12.5)).foregroundStyle(Color.fxText)
                 Spacer()
                 Image(systemName: "chevron.down").font(.system(size: 10)).foregroundStyle(Color.fxText3)
             }
@@ -337,40 +530,90 @@ struct GenerateView: View {
         .menuStyle(.button)
         .menuIndicator(.hidden)
         .buttonStyle(.plain)
-        .disabled(vm.availableLoRAs.isEmpty)
+        .disabled(selectable.isEmpty)
         .help(vm.availableLoRAs.isEmpty
               ? (vm.loRAsForOtherTier.isEmpty
                  ? "No \(vm.tier.shortName)-compatible adapters — import one on the LoRA tab."
                  : "No adapters for \(vm.tier.shortName). The ones you have are built for the other tier — switch the model on the Models tab to use them.")
-              : "Fuse a LoRA adapter into the next render. Changing the adapter set reloads clean model weights first — instant when cached, up to ~1 min from a cold disk. Manage adapters on the LoRA tab.")
+              : (selectable.isEmpty
+                 ? "All compatible adapters are already added."
+                 : "Stack a LoRA into the next render — effects combine, no fixed limit. Changing the set reloads clean weights first (instant when cached, up to ~1 min cold)."))
     }
 
-    /// Strength slider + trigger note for one selected LoRA slot.
-    @ViewBuilder private func loraSlotDetails(_ index: Int) -> some View {
-        if let lora = vm.loraSlots[index].item {
+    /// One added-LoRA row: name + remove, a strength slider, and its trigger note.
+    @ViewBuilder private func loraRow(_ slot: GenerateViewModel.LoRASlot) -> some View {
+        if let lora = slot.item {
             VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: "puzzlepiece.extension").font(.system(size: 10)).foregroundStyle(Color.fxAccent)
+                    Text(lora.fileName).font(.fx(12)).foregroundStyle(Color.fxText).lineLimit(1)
+                    Spacer(minLength: 6)
+                    Button { vm.sweepStrength(slot.id) } label: {
+                        Image(systemName: "slider.horizontal.below.square.and.square.filled").font(.system(size: 11))
+                            .foregroundStyle(Color.fxText3)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!vm.canGenerate)
+                    .help("Strength sweep — queue \(GenerateViewModel.sweepScales.count) renders of this prompt with ONE seed at strengths 0.6→1.1, so you can pick the cleanest (subject LoRAs often mutate at 1.0 and are clean around 0.8).")
+                    Button { vm.removeLoRA(slot.id) } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 13)).foregroundStyle(Color.fxText3)
+                    }
+                    .buttonStyle(.plain).help("Remove this LoRA")
+                }
                 HStack(spacing: 10) {
                     Text("Strength").fxLabel()
-                    Slider(value: $vm.loraSlots[index].scale, in: 0...1.5).tint(.fxAccent)
+                    Slider(value: Binding(
+                        get: { vm.loraSlots.first(where: { $0.id == slot.id })?.scale ?? slot.scale },
+                        set: { v in if let i = vm.loraSlots.firstIndex(where: { $0.id == slot.id }) { vm.loraSlots[i].scale = v } }
+                    ), in: 0...1.5).tint(.fxAccent)
                     TextField("", text: Binding(
-                        get: { String(format: "%.2f", vm.loraSlots[index].scale) },
-                        set: { vm.loraSlots[index].scale = min(max(Float($0.replacingOccurrences(of: ",", with: ".")) ?? vm.loraSlots[index].scale, 0), 1.5) }
+                        get: { String(format: "%.2f", vm.loraSlots.first(where: { $0.id == slot.id })?.scale ?? slot.scale) },
+                        set: { s in
+                            if let i = vm.loraSlots.firstIndex(where: { $0.id == slot.id }) {
+                                vm.loraSlots[i].scale = min(max(Float(s.replacingOccurrences(of: ",", with: ".")) ?? vm.loraSlots[i].scale, 0), 1.5)
+                            }
+                        }
                     ))
                     .frame(width: 44)
                     .multilineTextAlignment(.trailing)
                     .textFieldStyle(.plain)
                     .font(.fxMono(11)).foregroundStyle(Color.fxText2)
+                    pinDefaultButton(slot, lora)
                 }
                 .help("How strongly the adapter modifies the model — 1.00 = as trained. Changing it reloads clean weights before the next render.")
                 if lora.trigger.isEmpty {
                     Text("No trigger set — add one on the LoRA tab if needed.")
                         .font(.fx(11)).foregroundStyle(Color.fxText3)
                 } else {
-                    Text("Trigger “\(lora.trigger)” will be added to the prompt automatically.")
+                    // Teaches the [trigger] placeholder right where the trigger matters; flips
+                    // to "replaces" once the prompt actually carries this slot's token.
+                    let token = vm.triggerPlaceholderToken(for: slot.id) ?? "[trigger]"
+                    Text(vm.promptUsesTriggerPlaceholder(for: slot.id)
+                         ? "Trigger “\(lora.trigger)” replaces \(token) in the prompt."
+                         : "Trigger “\(lora.trigger)” will be added to the prompt automatically — or type \(token) to place it yourself.")
                         .font(.fx(11)).foregroundStyle(Color.fxAccent)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .padding(.vertical, 7).padding(.horizontal, 9)
+            .background(Color.fxInset.opacity(0.5), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
+    }
+
+    /// Pin the slot's current strength as the adapter's default (filled pin = already the default).
+    @ViewBuilder private func pinDefaultButton(_ slot: GenerateViewModel.LoRASlot, _ lora: LoRAItem) -> some View {
+        let current = vm.loraSlots.first(where: { $0.id == slot.id })?.scale ?? slot.scale
+        let isDefault = lora.defaultScale.map { abs($0 - current) < 0.005 } ?? false
+        Button { vm.saveDefaultScale(slot.id) } label: {
+            Image(systemName: isDefault ? "pin.fill" : "pin")
+                .font(.system(size: 10))
+                .foregroundStyle(isDefault ? Color.fxAccent : Color.fxText3)
+        }
+        .buttonStyle(.plain)
+        .disabled(isDefault)
+        .help(isDefault
+              ? "This strength is the adapter's default — it's pre-selected whenever you add it."
+              : "Save \(String(format: "%.2f", current)) as this adapter's default strength, applied whenever you add it.")
     }
 
     private var footer: some View {
@@ -396,7 +639,7 @@ struct GenerateView: View {
                 Text(vm.tier.license).lineLimit(1)
             }
             .font(.fxMono(11)).foregroundStyle(Color.fxText3)
-            .help("Klein is a 4-step distilled model — steps and guidance are fixed at the values it was trained for; more steps would not improve quality.")
+            .help("Steps are adjustable above — Klein's distilled sweet spot is 4; more steps refine detail but take longer (no reload). Guidance stays 1.0: the distilled Klein tiers are CFG-free (the engine ignores guidance for them), so there's no slider.")
 
             HStack(spacing: 10) {
                 FxStepper(label: "Batch (images per click)", value: $vm.batchCount, range: 1...8, step: 1)
@@ -439,6 +682,15 @@ struct GenerateView: View {
                 .buttonStyle(FxGhostButtonStyle(height: 30, accentText: true))
                 .disabled(!vm.canGenerate).opacity(vm.canGenerate ? 1 : 0.5)
                 .help("Add this as a task WITHOUT running it — line up several different prompts, then open the Queue tab and Run all.")
+                Button { saveCardDraft = vm.draftCardFromCurrentState() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "square.and.arrow.down").font(.system(size: 11, weight: .semibold))
+                        Text("Save as card")
+                    }.font(.fx(12))
+                }
+                .buttonStyle(FxGhostButtonStyle(height: 30))
+                .disabled(!vm.canGenerate).opacity(vm.canGenerate ? 1 : 0.5)
+                .help("Save this prompt + chips + settings as your own reusable Library card.")
                 if !vm.queue.isEmpty {
                     Button { openQueue() } label: {
                         Text("\(vm.queue.count) in queue →").font(.fx(11.5)).foregroundStyle(Color.fxAccent)
@@ -447,6 +699,12 @@ struct GenerateView: View {
                     .help("Open the Queue tab to manage and run your tasks.")
                 }
                 Spacer(minLength: 0)
+            }
+            .sheet(item: $saveCardDraft) { draft in
+                CardEditorView(draft: draft) { saved in
+                    CustomRecipeStore.shared.add(saved)
+                    saveCardDraft = nil
+                } onCancel: { saveCardDraft = nil }
             }
 
             if vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -473,10 +731,14 @@ struct GenerateView: View {
                     // Gate on actual pending work (the running item sits at queue[0], so >1 means
                     // at least one task is still waiting) — queueTotal is the run total and isn't
                     // decremented per image, so it would falsely promise "the queue stops" on the
-                    // LAST image of a series when nothing is actually pending.
-                    Text(vm.queue.count > 1
-                         ? "Can't interrupt the current image — it finishes, then the queue stops (kept for Run all)."
-                         : "Can't interrupt the current image — it will finish.")
+                    // LAST image of a series when nothing is actually pending. During a queued
+                    // UPSCALE item the "current image" phrasing would lie (and one still waiting
+                    // on the Real-ESRGAN gate is even kept, not finished) — name the work honestly.
+                    Text(vm.isUpscaling
+                         ? "Stops after the current upscale — tasks not yet run are kept for Run all."
+                         : (vm.queue.count > 1
+                            ? "Can't interrupt the current image — it finishes, then the queue stops (kept for Run all)."
+                            : "Can't interrupt the current image — it will finish."))
                         .font(.fx(10.5)).foregroundStyle(Color.fxText3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -614,14 +876,6 @@ struct GenerateView: View {
     }
 
 
-    /// Soft-focus the noisy early frames in "Every step" mode so they resolve into focus as
-    /// the render progresses; the single "At ~75%" frame and the final step stay sharp (0 blur).
-    private var previewBlurRadius: CGFloat {
-        guard vm.previewEveryStep, vm.previewStep < vm.steps else { return 0 }
-        let remaining = 1 - Double(vm.previewStep) / Double(max(1, vm.steps))   // step 1/4 → .75, 3/4 → .25
-        return CGFloat(6 * remaining)
-    }
-
     /// Live render preview as ONE explicit 3-state control. Hiding "Show every step" under a
     /// "Live preview" checkbox (it only appeared once the checkbox was ticked) left users asking
     /// "what is this?" — Off / At ~75% / Every step now read at a glance. The three chips map to
@@ -691,7 +945,7 @@ struct GenerateView: View {
         // References have their own drop box — this one is about the RECIPE.
         .onDrop(of: [UTType.fileURL], isTargeted: $recipeDropTargeted) { providers in
             guard let provider = providers.first else { return false }
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+            fxResolveDroppedFileURL(provider) { url in
                 guard let url else { return }
                 DispatchQueue.main.async {
                     // The result's drag-OUT starts inside this same drop region — an
@@ -765,8 +1019,12 @@ struct GenerateView: View {
 
     @ViewBuilder private var canvasContent: some View {
         if let img = vm.resultImage {
+            // Flip-compare: show the picked reference IN PLACE of the result (same frame), so
+            // identity/color/geometry drift jumps out. Zoom resets on flip (aspects may differ).
+            let flippedRef = flippedRefID.flatMap { id in vm.references.first { $0.id == id } }
+            let displayed = flippedRef?.image ?? img
             ZStack {
-                Image(decorative: img, scale: 1)
+                Image(decorative: displayed, scale: 1)
                     .resizable().scaledToFit()
                     .background(GeometryReader { geo in
                         Color.clear
@@ -787,9 +1045,20 @@ struct GenerateView: View {
                     })
                     .scaleEffect(resultZoom, anchor: .center)
                     .offset(resultPan)
-                    .onDrag { resultDragProvider() }
+                    // Drag exports what's DISPLAYED: dragging while flipped must hand out the
+                    // reference file, not silently the result (whose help text promises a recipe).
+                    .onDrag {
+                        if let ref = flippedRef {
+                            guard let u = ref.url, let p = NSItemProvider(contentsOf: u) else { return NSItemProvider() }
+                            p.suggestedName = u.lastPathComponent
+                            return p
+                        }
+                        return resultDragProvider()
+                    }
                     .onTapGesture(count: 2) { withAnimation(.easeOut(duration: 0.15)) { resultZoom = 1; resultPan = .zero } }
-                    .help("Scroll to zoom toward the cursor · double-click to reset. Drag the image out — into Finder, a chat, an editor. The dragged PNG carries the full recipe (prompt, seed, size, LoRA); re-saving as JPEG strips it.")
+                    .help(flippedRef == nil
+                          ? "Scroll to zoom toward the cursor · double-click to reset. Drag the image out — into Finder, a chat, an editor. The dragged PNG carries the full recipe (prompt, seed, size, LoRA); re-saving as JPEG strips it."
+                          : "Showing the reference — click its thumbnail again for the result. Dragging exports the reference file.")
                 resultOverlays
             }
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -797,12 +1066,11 @@ struct GenerateView: View {
             Group {
                 if let prev = vm.previewImage {
                     // Live render preview — the image taking shape, crossfading between steps.
-                    // Early "Every step" frames are soft-focused so they resolve INTO clarity
-                    // instead of flashing raw latent noise (the harsh raw-noise look the user disliked).
+                    // Shown RAW, Draw-Things-style (user request 2026-07-03): early frames ARE
+                    // noisy, and that's honest — the old soft-focus hid what the render was doing.
                     ZStack {
                         Image(decorative: prev, scale: 1)
                             .resizable().scaledToFit()
-                            .blur(radius: previewBlurRadius)
                             .id(vm.previewStep)               // new identity per step → the fade fires
                             .transition(.opacity)
                         VStack {
@@ -810,7 +1078,7 @@ struct GenerateView: View {
                                 Spacer()
                                 HStack(spacing: 6) {
                                     FxDot(tone: .amber, live: true, size: 6)
-                                    Text("preview · step \(vm.previewStep)/\(vm.steps)")
+                                    Text("preview · step \(vm.previewStep)/\(vm.renderSteps)")
                                 }
                                 .font(.fxMono(10.5)).foregroundStyle(Color.fxText)
                                 .fxChip(padV: 3, padH: 9)
@@ -827,7 +1095,16 @@ struct GenerateView: View {
                             Ring(pct: vm.progress, size: 76, lineWidth: 6)
                             Text("\(Int(vm.progress * 100))%").font(.fxMono(15, weight: .bold)).foregroundStyle(Color.fxText)
                         }
-                        Text("step \(vm.currentStep) / \(vm.steps)").font(.fxMono(12)).foregroundStyle(Color.fxText2)
+                        // Before step 1, name the actual phase (loading weights / encoding) —
+                        // a bare "step 0 / N" read as frozen during a cold 9B load.
+                        if vm.currentStep == 0, let phase = vm.renderPhase {
+                            Text(phase).font(.fxMono(12)).foregroundStyle(Color.fxText2)
+                                .lineLimit(1).frame(maxWidth: 320)
+                        } else {
+                            Text("step \(vm.currentStep) / \(vm.renderSteps)"
+                                 + (vm.lastStepSeconds.map { String(format: " · %.1f s/step", $0) } ?? ""))
+                                .font(.fxMono(12)).foregroundStyle(Color.fxText2)
+                        }
                     }
                 }
             }
@@ -850,10 +1127,33 @@ struct GenerateView: View {
                     .font(.fx(14, weight: .semibold)).foregroundStyle(Color.fxText)
                 Text(vm.modelMissing
                      ? "Download it once in the Models tab — after that everything runs offline."
-                     : "One click on \u{201C}Get encoder\u{201D} in the Models tab fixes it.")
+                     // The rebuilt Models tab has no "Get encoder" button — the encoder is its
+                     // own download row now, so point at that.
+                     : "Download its Text Encoder row in the Models tab — one click fixes it.")
                     .font(.fx(12)).foregroundStyle(Color.fxText3)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 360)
+                if !vm.missingAssets.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(vm.missingAssets) { a in
+                            HStack(spacing: 8) {
+                                Image(systemName: "shippingbox").font(.system(size: 11)).foregroundStyle(Color.fxText3)
+                                Text(a.label).font(.fx(11.5)).foregroundStyle(Color.fxText2)
+                                Spacer(minLength: 10)
+                                Text("~\(a.gb) GB").font(.fxMono(11)).foregroundStyle(Color.fxText3)
+                            }
+                        }
+                        Divider()
+                        HStack {
+                            Text("Total to download").font(.fx(11.5, weight: .semibold)).foregroundStyle(Color.fxText2)
+                            Spacer(minLength: 10)
+                            Text("~\(vm.missingAssetsTotalGB) GB").font(.fxMono(11)).foregroundStyle(Color.fxAccent)
+                        }
+                    }
+                    .padding(11)
+                    .frame(maxWidth: 360)
+                    .background(Color.fxInset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
                 Button("Open Models") { openModels() }
                     .buttonStyle(FxPrimaryButtonStyle(height: 32))
             }
@@ -897,7 +1197,7 @@ struct GenerateView: View {
                     .help("Put this image's seed into the Seed field — follow-up renders iterate on the same composition")
                 Button { vm.useResultAsReference() } label: { Text("to I2I").font(.fx(10.5)).foregroundStyle(Color.fxText) }
                     .buttonStyle(.plain).fxChip(padV: 3, padH: 9)
-                    .help("Add this result as an I2I reference (max 3). The first reference also snaps the output size to its aspect ratio.")
+                    .help("Add this result as an I2I reference (max \(GenerateViewModel.maxReferences)). The first reference also snaps the output size to its aspect ratio.")
                 Button { vm.clearPreview() } label: {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(Color.fxText)
                 }
@@ -907,12 +1207,45 @@ struct GenerateView: View {
             .padding(12)
             .background(LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .top, endPoint: .bottom))
             Spacer()
+            if !vm.references.isEmpty { refFlipStrip }
             canvasBottomBar {
                 Text("\(vm.width) × \(vm.height) · \(vm.steps) steps")
                 Spacer()
                 Text(resultMeta)
             }
         }
+    }
+
+    /// Flip-compare strip: one thumb per loaded reference; click flips the canvas between that
+    /// reference and the result at the same size, click again to return.
+    private var refFlipStrip: some View {
+        HStack(spacing: 6) {
+            ForEach(vm.references) { ref in
+                Button {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        flippedRefID = (flippedRefID == ref.id) ? nil : ref.id
+                        resultZoom = 1; resultPan = .zero   // aspect may differ — re-fit
+                    }
+                } label: {
+                    Image(decorative: ref.image, scale: 1)
+                        .resizable().scaledToFill()
+                        .frame(width: 38, height: 38)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(flippedRefID == ref.id ? Color.fxAccent : Color.white.opacity(0.35),
+                                          lineWidth: flippedRefID == ref.id ? 2 : 1))
+                }
+                .buttonStyle(.plain)
+                .help("Flip between this reference and the result in place — the honest way to judge whether the fine identity survived, not just the general look.")
+            }
+            if flippedRefID != nil, vm.references.contains(where: { $0.id == flippedRefID }) {
+                Text("showing reference — click again for the result")
+                    .font(.fxMono(9.5)).foregroundStyle(Color.fxText)
+                    .fxChip(padV: 3, padH: 8)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 12).padding(.bottom, 6)
     }
 
     private var resultMeta: String {
@@ -974,7 +1307,7 @@ struct GenerateView: View {
                         if let eta = vm.etaSeconds, eta > 0 {
                             Text(etaHuman(eta)).font(.fxMono(11)).foregroundStyle(Color.fxText3)
                         }
-                        Text("step \(vm.currentStep) of \(vm.steps)")
+                        Text("step \(vm.currentStep) of \(vm.renderSteps)")
                             .font(.fxMono(10.5)).foregroundStyle(Color.fxText3)
                         if vm.queueRunning && vm.queueTotal > 1 {
                             Text("image \(min(vm.queueDone + 1, vm.queueTotal)) of \(vm.queueTotal)")
@@ -992,7 +1325,12 @@ struct GenerateView: View {
     }
 
     private var genStateWord: String {
-        if vm.isBusy { return vm.currentStep == 0 ? "warming up" : "rendering" }
+        if vm.isBusy {
+            // A queued upscale never ticks a denoise step, so currentStep stays 0 for its whole
+            // run — "warming up" read as a hung render. Name the real work instead.
+            if vm.isUpscaling { return "upscaling" }
+            return vm.currentStep == 0 ? "warming up" : "rendering"
+        }
         return vm.progress > 0 ? "done" : "idle"
     }
 
@@ -1130,7 +1468,7 @@ struct GenerateView: View {
     }
 }
 
-// ── Reference images (up to 3 slots) / drop zone ─────────────────────────────
+// ── Reference images (up to 4 slots) / drop zone ─────────────────────────────
 private struct ReferenceImageSection: View {
     @Bindable var vm: GenerateViewModel
     @State private var isTargeted = false
@@ -1160,7 +1498,7 @@ private struct ReferenceImageSection: View {
                     Spacer(minLength: 0)
                 }
                 if vm.references.count >= 2 {
-                    Text("Each reference adds time at 1024²: Klein 9B — 2 refs ≈ 6–7 min, 3 refs ≈ 10 min; Klein 4B — 1 ref ≈ 2.5 min, 3 refs ≈ 7 min.")
+                    Text("Each reference adds time at 1024² (RAM stays ~flat): Klein 9B — 2 refs ≈ 6–7 min, 3 refs ≈ 10 min, 4 refs ≈ 14 min; Klein 4B is faster.")
                         .font(.fx(11)).foregroundStyle(Color.fxText3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1220,12 +1558,12 @@ private struct ReferenceImageSection: View {
                                 // On-disk file (Finder/Desktop): decode from the reliable image
                                 // DATA (loadObject(URL:) is flaky for Finder drags — the #13 bug),
                                 // but ALSO keep the file URL so the saved recipe records this
-                                // reference (buildRequest reads slot.url?.path). A nil URL falls
-                                // back to the data-only behavior — no regression vs before. The
-                                // box captures the (thread-safe but non-Sendable) provider into the
-                                // outer @Sendable completion so the nested data load is warning-free.
+                                // reference (buildRequest reads slot.url?.path) and the gallery
+                                // gets its "Reference:" line + flip. The box captures the
+                                // (thread-safe but non-Sendable) provider into the outer
+                                // @Sendable completion so the nested data load is warning-free.
                                 let box = SendableProvider(provider)
-                                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                                fxResolveDroppedFileURL(provider) { url in
                                     _ = box.provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
                                         DispatchQueue.main.async {
                                             if let data {
@@ -1249,7 +1587,7 @@ private struct ReferenceImageSection: View {
                                 }
                             }
                         } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                            fxResolveDroppedFileURL(provider) { url in
                                 guard let url else { return }
                                 DispatchQueue.main.async { vm.addReference(from: url, snapToFirst: i == 0) }
                             }
@@ -1257,7 +1595,7 @@ private struct ReferenceImageSection: View {
                     }
                     return true
                 }
-                .help("Drop up to 3 images here, or click to choose files. The first reference sets the output size to its aspect; the engine downscales references to a ≤1024² area. Each extra reference adds minutes of render time.")
+                .help("Drop up to \(GenerateViewModel.maxReferences) images here, or click to choose files. The first reference sets the output size to its aspect; the engine downscales references to a ≤1024² area. Each extra reference adds minutes of render time.")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

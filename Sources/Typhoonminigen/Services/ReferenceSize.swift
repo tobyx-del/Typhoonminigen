@@ -21,6 +21,17 @@ enum ReferenceSize {
     /// (3 is coprime to 32). Snapping BOTH dims to /32 is the simple blanket guarantee.
     static let grain = 32
 
+    /// RAM-based generation-AREA cap, shared by the VM clamp and the engine's hard floor
+    /// (FluxEngine). Two hand-copied (threshold, cap) pairs once risked silent divergence:
+    /// on <16 GB the GPU aborts (mlx check_error → SIGABRT) above ~0.8 MP; everyone else
+    /// is bounded by Klein's 1536² maximum.
+    static let lowRAMThresholdGB = 16
+    static let lowRAMMaxArea = 820_000
+    static let standardMaxArea = 1536 * 1536   // 2_359_296
+    static func maxArea(forInstalledGB gb: Int) -> Int {
+        gb < lowRAMThresholdGB ? lowRAMMaxArea : standardMaxArea
+    }
+
     /// Round to the nearest /32, clamped to [minSide, maxSide]. For hand/restored values.
     static func snap(_ v: Int) -> Int {
         min(maxSide, max(minSide, Int((Double(v) / Double(grain)).rounded()) * grain))

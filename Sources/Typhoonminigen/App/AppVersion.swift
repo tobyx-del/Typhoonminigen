@@ -8,8 +8,8 @@ import Foundation
 ///   • `build`   — build number (CFBundleVersion), bumped +1 on every build.
 /// The status-bar badge renders them as `VERSION <current> BUILD <build>`.
 enum AppVersion {
-    static let current = "1.0"
-    static let build = "9"
+    static let current = "2.0"
+    static let build = "19"
 
     /// Badge text shown in the bottom status bar, e.g. "VERSION 1.0 BUILD 1".
     static var badge: String { "VERSION \(current) BUILD \(build)" }

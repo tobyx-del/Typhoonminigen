@@ -61,10 +61,13 @@ if grep -q 'if !referenceImages.isEmpty { req.upsamplePrompt = false }' "$SRC/Se
 else
     err "FluxEngine guard 'if !referenceImages.isEmpty { req.upsamplePrompt = false }' missing"
 fi
-if grep -q 'upsamplePrompt: upsamplePrompt && references.isEmpty' "$SRC/ViewModels/GenerateViewModel.swift"; then
-    ok "GenerateViewModel sends upsample only when references are empty"
+# isOverride = a Library-scene enqueue, which is T2I by construction (its request carries NO
+# references) — the FORM's leftover refs must not veto its Enhance. The canvas I2I path still
+# hard-ANDs references.isEmpty, and FluxEngine's own force-off above is the second layer.
+if grep -q 'upsamplePrompt: upsamplePrompt && (isOverride || references.isEmpty)' "$SRC/ViewModels/GenerateViewModel.swift"; then
+    ok "GenerateViewModel sends upsample only when the request itself has no references"
 else
-    err "GenerateViewModel guard 'upsamplePrompt && references.isEmpty' missing"
+    err "GenerateViewModel guard 'upsamplePrompt && (isOverride || references.isEmpty)' missing"
 fi
 
 echo

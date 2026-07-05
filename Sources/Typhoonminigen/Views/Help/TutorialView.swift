@@ -60,7 +60,7 @@ struct TutorialView: View {
             rows: [
                 Row(term: "Prompt", detail: "40–70 words is the sweet spot: subject, scene, light, mood."),
                 Row(term: "Presets & LOOKS", detail: "Chips append proven phrases to your prompt; LOOKS bundle several at once."),
-                Row(term: "Aspect chips", detail: "1:1, 4:5, 3:2, 16:9 and 9:16 all stay near Klein's ~1 MP sweet spot — upscale ×2/×4 afterwards."),
+                Row(term: "Aspect chips", detail: "Seven ratios from 1:1 to 9:16 — all stay near Klein's ~1 MP sweet spot; upscale ×2/×4 afterwards."),
                 Row(term: "Seed", detail: "The same seed with the same settings reproduces an image exactly."),
                 Row(term: "Batch", detail: "Renders several variants — a fixed seed runs seed, seed+1, …; an empty seed gives each image a fresh random one."),
                 Row(term: "Tidy up", detail: "The chevron by the prompt hides the panels below it for a cleaner view."),
@@ -71,9 +71,10 @@ struct TutorialView: View {
             title: "Library — ready-made scenes",
             intro: "Don't feel like writing a prompt? Pick a ready scene and make it yours.",
             rows: [
-                Row(term: "Studios", detail: "Browse scenes by category — portrait, product, cinema, interiors, food, cars and more."),
-                Row(term: "Preview & load", detail: "Each card shows an example image of the result; tap it to load that scene into Generate, then just swap the subject."),
+                Row(term: "Studios", detail: "Browse scenes by category — portrait, product, cinema, interiors, exteriors, food, cars and more."),
+                Row(term: "Preview & load", detail: "Each card's preview is a real render of that recipe; tap it to load the scene into Generate — swap in your subject, or render unchanged to reproduce it."),
                 Row(term: "Add to queue", detail: "The ⊕ on a card lines the scene up in the queue — stack several, then Run all."),
+                Row(term: "Make it yours", detail: "Hide any card or section (Restore all undoes it), build your own cards — or press “Save as card” on Generate to turn the current form and render into one."),
                 Row(term: "Honest notes", detail: "Each card says what Klein can't nail, and a panel lists what to avoid — legible text, logos, real 3D files."),
             ]),
         Page(
@@ -91,10 +92,20 @@ struct TutorialView: View {
             title: "References & LoRA",
             intro: "Guide the result with images, not just words.",
             rows: [
-                Row(term: "References", detail: "Drop up to 3 images — Klein keeps faces and composition while your prompt drives the scene."),
+                Row(term: "References", detail: "Drop up to 4 images — Klein keeps faces and composition while your prompt drives the scene."),
                 Row(term: "No masks", detail: "Klein regenerates the whole image; there is no inpaint brush."),
                 Row(term: "Describe with AI", detail: "Turns a reference into editable prompt text."),
-                Row(term: "LoRA", detail: "Adapters add styles or characters — Klein-architecture only; trigger words append automatically."),
+                Row(term: "LoRA", detail: "Adapters add styles or characters — stack as many as you like, each with its own strength; trigger words append automatically."),
+            ]),
+        Page(
+            icon: "graduationcap",
+            title: "Train your own LoRA",
+            intro: "Teach Klein your subject or style from your own photos — fully on this Mac.",
+            rows: [
+                Row(term: "Workshop", detail: "Collect 10–50 photos, pick a single trigger word, and caption them — Auto-caption writes captions with the local vision model."),
+                Row(term: "Training", detail: "Pick steps and resolution, then watch the live loss curve and checkpoints. Klein 4B trains on a 32 GB Mac; 9B needs 48 GB+."),
+                Row(term: "Publish", detail: "Compare checkpoints side by side against a no-LoRA baseline and publish the best one straight into your LoRA library, trigger included."),
+                Row(term: "Queue", detail: "Line up several trainings — they run one after another, and queued renders fire the moment training ends."),
             ]),
         Page(
             icon: "photo.stack",

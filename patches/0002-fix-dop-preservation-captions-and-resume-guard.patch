@@ -1,0 +1,104 @@
+From 3f529a772a6815841ac32dc745e2fe5062ec55cc Mon Sep 17 00:00:00 2001
+From: abgitdev <266600699+abgitdev@users.noreply.github.com>
+Date: Sun, 5 Jul 2026 03:52:16 +0800
+Subject: [PATCH] Fix DOP preservation captions after filename re-keying; guard
+ resume-past-target step range
+
+DOP setup derived preservation captions from cachedEmbeddings dictionary
+KEYS. Callers (app and CLI) re-key that dictionary by image filename for
+caption-image pairing, so the trigger-to-class substitution never matched
+and DOP silently regularized against text embeddings of filename strings.
+Derive the caption from the entry's caption field instead - correct for
+both filename and caption key styles - while keeping both preservation
+maps keyed by the outer dictionary key so the training-loop lookup
+preservationEmbeddings[findCaption(...)] still resolves. Also encode each
+unique preservation caption once and share the embedding across keys.
+
+Guard the training loop range: a stale or foreign checkpoint can report
+startStep >= maxSteps, and the closed range (startStep+1)...maxSteps then
+traps fatally. Finish gracefully with a success notification instead.
+---
+ .../Training/Loop/SimpleLoRATrainer.swift     | 45 ++++++++++++++-----
+ 1 file changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/Sources/Flux2Core/Training/Loop/SimpleLoRATrainer.swift b/Sources/Flux2Core/Training/Loop/SimpleLoRATrainer.swift
+index 3b97ce3..6512f28 100644
+--- a/Sources/Flux2Core/Training/Loop/SimpleLoRATrainer.swift
++++ b/Sources/Flux2Core/Training/Loop/SimpleLoRATrainer.swift
+@@ -468,24 +468,38 @@ public final class SimpleLoRATrainer {
+             print("  Preservation class: '\(config.dopPreservationClass)'")
+             print("  Multiplier: \(config.dopMultiplier)")
+             
+-            // Create preservation captions (trigger word → preservation class)
+-            for (caption, _) in cachedEmbeddings {
+-                let preservationCaption = caption.replacingOccurrences(
++            // Create preservation captions (trigger word → preservation class).
++            // NOTE: callers may key `cachedEmbeddings` by image FILENAME instead of
++            // caption text (for caption↔image pairing via findCaption), so the caption
++            // must be read from the ENTRY, never from the dictionary key. Both maps
++            // stay keyed by the outer dictionary key so the training-loop lookup
++            // `preservationEmbeddings[findCaption(...)]` resolves for either key style.
++            for (key, entry) in cachedEmbeddings {
++                let preservationCaption = entry.caption.replacingOccurrences(
+                     of: config.triggerWord!,
+                     with: config.dopPreservationClass
+                 )
+-                captionToPreservationCaption[caption] = preservationCaption
++                captionToPreservationCaption[key] = preservationCaption
+             }
+-            
++
+             // Encode preservation embeddings
+             if let textEncoder = textEncoder {
+                 print("  Encoding \(captionToPreservationCaption.count) preservation captions...")
+-                for (originalCaption, preservationCaption) in captionToPreservationCaption {
+-                    // Skip if already encoded (same caption)
+-                    if preservationEmbeddings[originalCaption] == nil {
++                // Encode each unique caption text once and share the embedding
++                // (filename keys can map many entries to the same caption)
++                var embeddingByCaptionText: [String: MLXArray] = [:]
++                for (key, preservationCaption) in captionToPreservationCaption {
++                    // Skip if already encoded (same key)
++                    if preservationEmbeddings[key] == nil {
+                         do {
+-                            let embedding = try await textEncoder(preservationCaption)
+-                            preservationEmbeddings[originalCaption] = CachedEmbeddingEntry(
++                            let embedding: MLXArray
++                            if let cached = embeddingByCaptionText[preservationCaption] {
++                                embedding = cached
++                            } else {
++                                embedding = try await textEncoder(preservationCaption)
++                                embeddingByCaptionText[preservationCaption] = embedding
++                            }
++                            preservationEmbeddings[key] = CachedEmbeddingEntry(
+                                 caption: preservationCaption,
+                                 embedding: embedding
+                             )
+@@ -494,7 +508,7 @@ public final class SimpleLoRATrainer {
+                         }
+                     }
+                 }
+-                print("  Encoded \(preservationEmbeddings.count) preservation embeddings")
++                print("  Encoded \(preservationEmbeddings.count) preservation embeddings (\(embeddingByCaptionText.count) unique)")
+             } else {
+                 print("  Warning: textEncoder not provided, DOP disabled")
+             }
+@@ -601,6 +615,15 @@ public final class SimpleLoRATrainer {
+         let trainingStartTime = Date()
+ 
+         // Training loop (start from startStep + 1 if resuming)
++        // Guard: a stale or foreign checkpoint can report startStep at or past the
++        // target — the closed range below would trap fatally. Finish gracefully.
++        guard startStep < config.maxSteps else {
++            let message = "Nothing to train: resume step \(startStep) already at the target \(config.maxSteps)."
++            print(message)
++            isRunning = false
++            controller?.notifyFinished(success: true, message: message)
++            return
++        }
+         let firstStep = startStep + 1
+         for step in firstStep...config.maxSteps {
+             // Update current step FIRST (before stop/pause checks so checkpoint has correct step)
+-- 
+2.50.1 (Apple Git-155)
+
