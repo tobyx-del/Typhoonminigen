@@ -37,8 +37,10 @@ echo "▸ Mistral fuse tripwire…"
 }
 
 echo "▸ building Typhoonminigen $VERSION (build $BUILD, $CONFIG)…"
-xcodebuild -scheme Typhoonminigen -destination 'platform=macOS' \
-    -configuration "$CONFIG" -derivedDataPath "$DERIVED" build | tail -2
+xcodebuild -scheme Typhoonminigen -destination 'platform=macOS,arch=arm64' \
+    -configuration "$CONFIG" -derivedDataPath "$DERIVED" \
+    -skipMacroValidation -skipPackagePluginValidation \
+    CODE_SIGNING_ALLOWED=NO build | tail -80
 
 echo "▸ assembling $APP"
 rm -rf "$APP"
