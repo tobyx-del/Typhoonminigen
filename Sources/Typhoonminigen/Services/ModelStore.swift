@@ -121,7 +121,7 @@ actor ModelStore {
             ModelGroupInfo(
                 id: s.id, title: s.title, subtitle: s.subtitle, ramBadge: s.ramBadge,
                 nonCommercial: s.nonCommercial, encoderHeader: s.encoderHeader,
-                transformers: s.transformers.map { info(.transformer($0)) },
+                transformers: s.transformers.map { info(.transformer($0)) } + (s.id == "klein9b" ? [info(.quantizedKlein9B)] : []),
                 encoders: s.encoders.map { info(.encoder($0)) }
             )
         }
@@ -129,6 +129,14 @@ actor ModelStore {
 
     private func info(_ kind: ComponentKind) -> ComponentInfo {
         switch kind {
+        case .quantizedKlein9B:
+            let ok = Klein9BMLXInt4Model.isAvailable
+            return ComponentInfo(id: "tf-klein9b-int4", kind: kind,
+                title: "MLX 9B Int4 (pre-quantized)", rawTag: "klein9b-int4",
+                sizeGB: 5, isGated: false,
+                repoURL: "https://huggingface.co/mlx-community/flux2-klein-9b-4bit",
+                isDownloaded: ok,
+                downloadedBytes: ok ? Self.directorySize(Klein9BMLXInt4Model.transformerDirectory) : 0)
         case .transformer(let v):
             let comp = ModelRegistry.ModelComponent.transformer(v)
             let dl = Flux2ModelDownloader.isDownloaded(comp)
@@ -154,6 +162,7 @@ actor ModelStore {
     /// "Delete partial" action would look at the wrong place.
     private static func destDir(_ kind: ComponentKind) -> URL {
         switch kind {
+        case .quantizedKlein9B: return Klein9BMLXInt4Model.transformerDirectory
         case .transformer(let v):
             return ModelRegistry.localPath(for: .transformer(v))
         case .encoder(let v):
@@ -201,6 +210,14 @@ actor ModelStore {
         // whole-file-temp downloaders — so a cancel / app-quit / stall keeps the bytes already
         // fetched and continues from there. We write into the SAME dirs the engine reads back.
         switch kind {
+        case .quantizedKlein9B:
+            try await ResumableDownloader.download(
+                repoId: Klein9BMLXInt4Model.repository, subfolder: "transformer",
+                destDir: Klein9BMLXInt4Model.transformerDirectory,
+                token: nil, onProgress: onProgress)
+            guard Klein9BMLXInt4Model.isAvailable else {
+                throw ResumableDownloadError.incomplete("Klein 9B MLX Int4 transformer")
+            }
         case .transformer(let v):
             try await ResumableDownloader.download(
                 repoId: v.huggingFaceRepo,
@@ -221,6 +238,16 @@ actor ModelStore {
     /// Delete one component. Returns bytes reclaimed, or nil for a symlink-import.
     func delete(kind: ComponentKind) throws -> Int64? {
         switch kind {
+        case .quantizedKlein9B:
+            let dir = Klein9BMLXInt4Model.transformerDirectory
+            guard FileManager.default.fileExists(atPath: dir.path) else { return 0 }
+            if Self.isSymlink(dir) {
+                try FileManager.default.removeItem(at: dir)
+                return nil
+            }
+            let size = Self.directorySize(dir)
+            try FileManager.default.removeItem(at: dir)
+            return size
         case .transformer(let v):
             let comp = ModelRegistry.ModelComponent.transformer(v)
             // findModelPath keeps the unresolved URL, so removeItem deletes only the link.

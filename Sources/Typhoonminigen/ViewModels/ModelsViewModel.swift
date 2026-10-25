@@ -277,6 +277,7 @@ final class ModelsViewModel {
     /// variants (.bf16/.qint8) aren't exposed by any tier the app ships — nil, no warning.
     private static func tier(of kind: ComponentKind) -> ModelTier? {
         switch kind {
+        case .quantizedKlein9B: return .klein9B
         case .transformer(let v):
             switch v {
             case .klein4B_8bit, .klein4B_bf16: return .klein4B

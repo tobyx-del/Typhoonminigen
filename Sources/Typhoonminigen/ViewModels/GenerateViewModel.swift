@@ -612,6 +612,14 @@ final class GenerateViewModel {
     var onGenerationIdle: (() -> Void)? = nil
 
     /// Queue-tab "Run all": start the composed queue. (#1)
+    /// 9B Int4 is stored as community MLX shards, not the BF16 registry variant.
+    private static func transformerInstalled(for request: GenerationRequest) -> Bool {
+        if request.tier == .klein9B {
+            return request.quant.transformer == .int4 && Klein9BMLXInt4Model.isAvailable
+        }
+        return Flux2ModelDownloader.isDownloaded(.transformer(request.transformerVariant))
+    }
+
     func runAll() {
         guard !isDescribing else {
             errorMessage = "Finish describing the reference first — it's using the GPU."
@@ -631,7 +639,7 @@ final class GenerateViewModel {
             let tier = item.request.tier
             let key = "\(tier.rawValue)|\(item.request.transformerVariant)"
             guard probed.insert(key).inserted else { continue }
-            if !Flux2ModelDownloader.isDownloaded(.transformer(item.request.transformerVariant)) {
+            if !Self.transformerInstalled(for: item.request) {
                 let rung = item.request.quality.flatMap(QualityPreset.init(rawValue:)).map { " \($0.label)" } ?? ""
                 errorMessage = "Task \(idx + 1) needs \(tier.shortName)\(rung) — it isn't downloaded yet. Open the Models tab to download it, then Run all again."
                 statusMessage = ""
@@ -758,7 +766,7 @@ final class GenerateViewModel {
     /// The selected model + encoder must be on disk before a run — otherwise the engine fetches
     /// gigabytes silently mid-generation. (Queued mixed-tier items are re-checked per item.)
     private func ensureModelReady() -> Bool {
-        if !Flux2ModelDownloader.isDownloaded(.transformer(tier.transformerVariant(for: quality))) {
+        if !(tier == .klein9B ? Klein9BMLXInt4Model.isAvailable : Flux2ModelDownloader.isDownloaded(.transformer(tier.transformerVariant(for: quality)))) {
             errorMessage = "\(tier.shortName) \(quality.label) isn't downloaded yet. Open the Models tab to download it, then come back."
             statusMessage = ""
             return false
@@ -1035,7 +1043,7 @@ final class GenerateViewModel {
         }
         // Per-item download guard: a queued mixed-tier task whose model isn't on disk would make
         // the engine fetch gigabytes silently. Skip it instead of triggering a hidden download.
-        guard Flux2ModelDownloader.isDownloaded(.transformer(item.request.transformerVariant)),
+        guard Self.transformerInstalled(for: item.request),
               item.request.tier.isEncoderDownloaded else {
             errorMessage = "\(item.request.tier.shortName) isn't downloaded — open the Models tab. (Task skipped.)"
             return false
@@ -1274,7 +1282,7 @@ final class GenerateViewModel {
         // (the old shape), that sync I/O ran on the main thread and, under a saturated disk,
         // stalled the very UI these flags exist to keep responsive.
         let probe = await Task.detached(priority: .userInitiated) {
-            (transformerMissing: !Flux2ModelDownloader.isDownloaded(.transformer(tier.transformerVariant(for: quality))),
+            (transformerMissing: tier == .klein9B ? !Klein9BMLXInt4Model.isAvailable : !Flux2ModelDownloader.isDownloaded(.transformer(tier.transformerVariant(for: quality))),
              encoderMissing: !tier.isEncoderDownloaded,
              nineB: ModelTier.klein9B.encodersOnDisk)
         }.value
@@ -1657,7 +1665,7 @@ final class GenerateViewModel {
         var settingsNote = ""
         if let t = recipe.tier, t != tier {
             let q = recipe.quality ?? t.defaultQuality
-            if Flux2ModelDownloader.isDownloaded(.transformer(t.transformerVariant(for: q))) {
+            if (t == .klein9B ? Klein9BMLXInt4Model.isAvailable : Flux2ModelDownloader.isDownloaded(.transformer(t.transformerVariant(for: q)))) {
                 tier = t
             } else {
                 settingsNote = " This preview was made on \(t.shortName) — switch to it (and download it) for the exact result."
@@ -1744,7 +1752,7 @@ final class GenerateViewModel {
         var out: [MissingAsset] = []
         if modelMissing {
             let tv = tier.transformerVariant(for: quality)
-            out.append(MissingAsset(label: "\(tier.shortName) transformer · \(quality.label)", gb: tv.estimatedSizeGB))
+            out.append(MissingAsset(label: "\(tier.shortName) transformer · \(quality.label)", gb: tier == .klein9B ? 5 : tv.estimatedSizeGB))
         }
         if encoderMissing {
             out.append(MissingAsset(label: "\(tier.shortName) text encoder", gb: tier.encoderVariant(for: quality).estimatedSizeGB))
@@ -1759,7 +1767,7 @@ final class GenerateViewModel {
     /// Cached flags only (see missingAssets) — this line sits in the model card's body.
     var qualityDownloadHint: String? {
         var gb = 0
-        if modelMissing { gb += tier.transformerVariant(for: quality).estimatedSizeGB }
+        if modelMissing { gb += tier == .klein9B ? 5 : tier.transformerVariant(for: quality).estimatedSizeGB }
         if encoderMissing { gb += tier.encoderVariant(for: quality).estimatedSizeGB }
         guard gb > 0 else { return nil }
         return "Requires ~\(gb) GB download for \(quality.label) — open the Models tab."

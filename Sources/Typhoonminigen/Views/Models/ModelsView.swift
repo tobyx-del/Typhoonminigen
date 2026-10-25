@@ -26,10 +26,10 @@ struct ModelsView: View {
                             Text(vm.tokenSaved ? "HuggingFace · token saved" : "HuggingFace · no token")
                         }
                         .font(.fxMono(11)).foregroundStyle(Color.fxText3)
-                        .help("Shows whether a HuggingFace token is saved in the Keychain. Only the gated 9B weights need one — 4B and all encoders download without it.")
+                        .help("Shows whether a HuggingFace token is saved in the Keychain. Only 9B Base training weights need one; the MLX Int4 inference model does not.")
                     }
 
-                    Text("Each Klein model needs a diffusion transformer and a text encoder (LLM) — download both for the tier you want. The 4-bit encoder is lighter on RAM and disk; the engine uses whichever encoder it finds on disk. Gated 9B weights need a free HuggingFace token (kept in your Keychain, never leaves this Mac).")
+                    Text("Each Klein model needs a diffusion transformer and a text encoder (LLM) — download both for the tier you want. The 4-bit encoder is lighter on RAM and disk; the engine uses whichever encoder it finds on disk. 9B Int4 inference weights do not need a token; 9B Base training still requires the original license.")
                         .font(.fx(12)).foregroundStyle(Color.fxText3)
                         .fixedSize(horizontal: false, vertical: true).lineSpacing(2)
                         .frame(maxWidth: 640, alignment: .leading)
@@ -189,7 +189,7 @@ struct ModelsView: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
                 (Text("HuggingFace token ").foregroundColor(.fxText2)
-                 + Text("(gated 9B weights only)").foregroundColor(.fxText3))
+                 + Text("(optional · 9B Base training only)").foregroundColor(.fxText3))
                     .font(.fx(12, weight: .medium))
                 Spacer()
                 if vm.tokenSaved {

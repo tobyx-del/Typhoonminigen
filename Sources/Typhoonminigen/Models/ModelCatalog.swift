@@ -14,6 +14,7 @@ import FluxTextEncoders
 enum ComponentKind: Hashable, Sendable {
     case transformer(ModelRegistry.TransformerVariant)
     case encoder(Qwen3Variant)
+    case quantizedKlein9B
 }
 
 /// View-friendly description of one component row (with live on-disk status).
@@ -78,15 +79,12 @@ enum ModelCatalog {
         ModelGroupSpec(
             id: "klein9b",
             title: "Flux Klein (9B)",
-            // LIVE-MEASURED generation footprint, not the engine's optimistic estimate: 9B
-            // peaks at ~19–20 GB while generating, which needs a 32 GB Mac in practice
-            // (macOS + the app + encoder headroom) — "16 GB" undersold it badly.
-            subtitle: "Quality model, ~19–20 GB RAM while generating",
-            ramBadge: "32 GB Mac",
+            subtitle: "Experimental MLX Int4 inference, optimized for 16 GB Macs",
+            ramBadge: "16 GB · experimental",
             nonCommercial: true,
             encoderHeader: "Qwen3 8B",
-            transformers: [.klein9B_bf16],
-            encoders: [.qwen3_8B_8bit, .qwen3_8B_4bit]
+            transformers: [],
+            encoders: [.qwen3_8B_4bit]
         ),
     ]
 

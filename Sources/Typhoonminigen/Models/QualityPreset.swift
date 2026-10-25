@@ -2,20 +2,9 @@ import Foundation
 import Flux2Core
 import FluxTextEncoders
 
-// ============================================================
-//  Render-quality presets — the Fluxforge "Quality" dropdown.
-//
-//  Quality = an (encoder-quant × transformer-quant) combination. Klein 4B exposes FOUR
-//  rungs (Low/Medium/Better/Best); Klein 9B exposes TWO (Standard/Best) because its
-//  transformer ships only as one bf16 repo.
-//
-//  ⚠ Honesty note: the TRANSFORMER quant (qint8 ↔ bf16) is the load-bearing axis — the
-//  engine honours it deterministically (loads the pre-quantized 4B-8bit repo, or quantizes
-//  the bf16 weights on the fly). The ENCODER quant (Qwen3 8-bit ↔ 4-bit) is the softer
-//  rung: the engine prefers whichever Qwen3 variant is already on disk, so it only takes
-//  effect when that level's encoder is the one present. The two transformer-distinct rungs
-//  per tier are therefore always real; the encoder split adds the extra 4B granularity.
-// ============================================================
+// The original four 4B quality levels stay untouched. Klein 9B offers one
+// low-memory preset: a pre-quantized native MLX Int4 transformer plus
+// Qwen3-8B 4-bit. The 9B inference path never loads BF16 weights.
 
 enum QualityPreset: String, CaseIterable, Identifiable, Sendable, Codable {
     case low, medium, better, best     // Klein 4B ladder
@@ -29,28 +18,27 @@ enum QualityPreset: String, CaseIterable, Identifiable, Sendable, Codable {
         case .medium:   return "Medium"
         case .better:   return "Better"
         case .best:     return "Best"
-        case .standard: return "Standard"
+        case .standard: return "MLX Int4"
         }
     }
 }
 
 /// The concrete quant pair a (tier, quality) resolves to.
 struct QualitySpec: Sendable {
-    let transformer: TransformerQuantization   // .qint8 (lighter) / .bf16 (full precision)
+    let transformer: TransformerQuantization   // .qint8 / .bf16 / .int4
     let encoder: MistralQuantization           // .mlx8bit / .mlx4bit (Qwen3)
 }
 
 extension ModelTier {
-    /// Quality rungs this tier offers (Fluxforge parity: 4B = 4, 9B = 2).
+    /// Four 4B quality rungs; a single MLX Int4 rung for 9B.
     var qualityPresets: [QualityPreset] {
         switch self {
         case .klein4B: return [.low, .medium, .better, .best]
-        case .klein9B: return [.standard, .best]
+        case .klein9B: return [.standard]
         }
     }
 
-    /// Default rung per tier: 4B = Medium (qint8 transformer + 8-bit encoder); 9B = Standard
-    /// (Full bf16 transformer — 9B ships only bf16 — + 4-bit encoder).
+    /// The 4B default is unchanged. 9B defaults to Int4 + 4-bit Qwen3.
     var defaultQuality: QualityPreset {
         switch self {
         case .klein4B: return .medium
@@ -65,10 +53,9 @@ extension ModelTier {
         case (.klein4B, .medium):   return QualitySpec(transformer: .qint8, encoder: .mlx8bit)
         case (.klein4B, .better):   return QualitySpec(transformer: .bf16,  encoder: .mlx4bit)
         case (.klein4B, .best):     return QualitySpec(transformer: .bf16,  encoder: .mlx8bit)
-        // 9B (Fluxforge parity): both rungs run the Full bf16 transformer (9B ships only bf16);
-        // the rung is the encoder bit-depth (Standard 4-bit → Best 8-bit), so the LLM changes.
-        case (.klein9B, .standard): return QualitySpec(transformer: .bf16, encoder: .mlx4bit)
-        case (.klein9B, .best):     return QualitySpec(transformer: .bf16, encoder: .mlx8bit)
+        // Int4 9B uses a native pre-quantized transformer, never BF16.
+        // Legacy 9B Best/unknown stored settings must never re-enable BF16.
+        case (.klein9B, _):         return QualitySpec(transformer: .int4, encoder: .mlx4bit)
         default:                    return QualitySpec(transformer: .qint8, encoder: .mlx8bit)
         }
     }
@@ -99,7 +86,7 @@ extension ModelTier {
         let s = qualitySpec(for: q)
         let name = self == .klein4B ? "Qwen3 4B" : "Qwen3 8B"
         let llm = s.encoder == .mlx4bit ? "4-bit" : "8-bit"
-        let diff = s.transformer == .bf16 ? "Full (bf16)" : "8-bit (qint8)"
+        let diff = s.transformer == .bf16 ? "Full (bf16)" : (s.transformer == .int4 ? "4-bit (MLX Int4)" : "8-bit (qint8)")
         return "\(name) · LLM: \(llm) · Diffuser: \(diff)"
     }
 }

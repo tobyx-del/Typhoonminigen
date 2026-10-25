@@ -1,0 +1,162 @@
+diff --git a/Sources/Flux2Core/Loading/WeightLoader.swift b/Sources/Flux2Core/Loading/WeightLoader.swift
+index 4bb2961..3e424ae 100644
+--- a/Sources/Flux2Core/Loading/WeightLoader.swift
++++ b/Sources/Flux2Core/Loading/WeightLoader.swift
+@@ -55,6 +55,59 @@ public class Flux2WeightLoader {
+         return try loadWeights(from: url.path)
+     }
+ 
++    /// Load already quantized MLX Diffusers-style weights, never materializing BF16
++    /// transformer weights. Validation is fail-closed: a missing or mismatched
++    /// quantized parameter is an error, not permission to render random weights.
++    static func loadKlein9BInt4Weights(from directory: URL, into model: Flux2Transformer2DModel) throws {
++        guard Klein9BMLXInt4Model.isAvailable else {
++            throw Flux2Error.modelNotLoaded("Missing MLX Klein 9B Int4 transformer. Download it in the Models tab.")
++        }
++        // A safetensors header can be valid even when the binary was cut short.
++        let index = directory.appendingPathComponent("model.safetensors.index.json")
++        let data = try Data(contentsOf: index)
++        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
++              let weights = object["weight_map"] as? [String: String] else {
++            throw Flux2Error.modelNotLoaded("Invalid MLX 9B Int4 shard index.")
++        }
++        for name in Set(weights.values) {
++            let url = directory.appendingPathComponent(name)
++            guard Flux2PrequantizedCheckpoint.payloadIsComplete(url: url) else {
++                throw Flux2Error.modelNotLoaded("Incomplete MLX 9B Int4 shard: \(name)")
++            }
++        }
++
++        var raw = try loadWeights(from: directory)
++        let mapped = mapTransformerWeights(&raw)
++        raw.removeAll()
++
++        // Native MLX QuantizedLinear parameter names match the model's camelCase
++        // layout; mapTransformerWeights translates Diffusers names and preserves
++        // .weight/.scales/.biases, without dequantizing the 4-bit payload.
++        let castParameters = Dictionary(uniqueKeysWithValues:
++            model.parameters().flattened().map { ($0.0, $0.1.asType(.float16)) })
++        _ = model.update(parameters: ModuleParameters.unflattened(castParameters))
++        quantize(model: model, groupSize: 64, bits: 4, mode: .affine)
++        let expected = Dictionary(uniqueKeysWithValues: Array(model.parameters().flattened()))
++        let missing = Set(expected.keys).subtracting(mapped.keys)
++        let extra = Set(mapped.keys).subtracting(expected.keys)
++        guard missing.isEmpty && extra.isEmpty else {
++            throw Flux2Error.modelNotLoaded("MLX 9B Int4 tensor mapping mismatch (missing \(missing.count), extra \(extra.count)).")
++        }
++
++        let floating: Set<DType> = [.float16, .bfloat16, .float32]
++        for (name, target) in expected {
++            guard let source = mapped[name] else { continue }
++            let dtypeOK = source.dtype == target.dtype ||
++                (floating.contains(source.dtype) && floating.contains(target.dtype))
++            guard source.shape == target.shape && dtypeOK else {
++                throw Flux2Error.modelNotLoaded("MLX 9B Int4 incompatible tensor: \(name).")
++            }
++        }
++
++        _ = try model.update(parameters: ModuleParameters.unflattened(mapped), verify: .shapeMismatch)
++        eval(model.parameters())
++    }
++
+     // MARK: - Transformer Weight Mapping
+ 
+     /// Detect if weights are in BFL (Black Forest Labs) native format
+diff --git a/Sources/Flux2Core/Pipeline/Flux2Pipeline.swift b/Sources/Flux2Core/Pipeline/Flux2Pipeline.swift
+index fd8320d..b1c66eb 100644
+--- a/Sources/Flux2Core/Pipeline/Flux2Pipeline.swift
++++ b/Sources/Flux2Core/Pipeline/Flux2Pipeline.swift
+@@ -377,6 +377,12 @@ public class Flux2Pipeline: @unchecked Sendable {
+             Flux2Debug.log("Memory warning: \(memCheck.message)")
+         }
+ 
++        // Never substitute a 17GB BF16 download for the requested 9B Int4.
++        if model == .klein9B && quantization.transformer == .int4
++            && !Klein9BMLXInt4Model.isAvailable {
++            throw Flux2Error.modelNotLoaded("Klein 9B Int4 is missing; download the 4-bit transformer first.")
++        }
++
+         // Download models if needed
+         if !hasRequiredModels {
+             try await downloadRequiredModels(progress: progressCallback)
+@@ -487,23 +493,28 @@ public class Flux2Pipeline: @unchecked Sendable {
+         memoryManager.logMemoryState()
+         Flux2Debug.log("Loading transformer for \(model.displayName)...")
+ 
++        // Reject old 9B BF16/qint8 requests before a model can be resolved.
++        if model == .klein9B && quantization.transformer != .int4 {
++            throw Flux2Error.invalidConfiguration("Klein 9B supports MLX Int4 only.")
++        }
++
+         // Get the appropriate transformer variant based on model type and quantization
+         let variant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
+ 
+-        // Find model path
+-        guard let modelPath = Flux2ModelDownloader.findModelPath(for: .transformer(variant)) else {
+-            let downloadCmd: String
+-            switch model {
+-            case .dev:
+-                downloadCmd = "flux2 download --transformer \(quantization.transformer.rawValue)"
+-            case .klein4B, .klein4BBase:
+-                downloadCmd = "flux2 download --model klein-4b"
+-            case .klein9B, .klein9BBase:
+-                downloadCmd = "flux2 download --model klein-9b"
+-            case .klein9BKV:
+-                downloadCmd = "flux2 download --model klein-9b-kv"
++        // A pre-quantized MLX 9B import is the ONLY 9B inference source on
++        // small Macs. Never fall back to downloading or loading the BF16 model.
++        let direct9BInt4 = model == .klein9B && quantization.transformer == .int4
++        let modelPath: URL
++        if direct9BInt4 {
++            guard Klein9BMLXInt4Model.isAvailable else {
++                throw Flux2Error.modelNotLoaded("Download the Klein 9B MLX Int4 transformer from the Models tab first.")
+             }
+-            let hint = Flux2ModelDownloader.unavailableReason(for: .transformer(variant)) ?? "Run: \(downloadCmd)"
++            modelPath = Klein9BMLXInt4Model.transformerDirectory
++        } else if let found = Flux2ModelDownloader.findModelPath(for: .transformer(variant)) {
++            modelPath = found
++        } else {
++            let hint = Flux2ModelDownloader.unavailableReason(for: .transformer(variant))
++                ?? "Download the required transformer in the Models tab."
+             throw Flux2Error.modelNotLoaded("\(model.displayName) transformer weights not found. \(hint)")
+         }
+ 
+@@ -524,7 +535,16 @@ public class Flux2Pipeline: @unchecked Sendable {
+         // Exports set `skipPrequantizedCheckpoint` to guarantee the result
+         // derives from the source weights, never from a previous export.
+         var loadedFromPrequantized = false
+-        if quantization.transformer != .bf16, !skipPrequantizedCheckpoint {
++        if direct9BInt4 {
++            do {
++                try Flux2WeightLoader.loadKlein9BInt4Weights(from: modelPath, into: transformer!)
++                loadedFromPrequantized = true
++                memoryManager.fullCleanup()
++            } catch {
++                unloadTransformer()
++                throw error
++            }
++        } else if quantization.transformer != .bf16, !skipPrequantizedCheckpoint {
+             loadedFromPrequantized = Flux2PrequantizedCheckpoint.load(
+                 into: transformer!,
+                 makeStructureClone: {
+@@ -2550,7 +2570,9 @@ extension Flux2Pipeline {
+     public var hasRequiredModels: Bool {
+         // Check transformer - use the appropriate variant for this model type and quantization
+         let transformerVariant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
+-        let hasTransformer = Flux2ModelDownloader.isDownloaded(.transformer(transformerVariant))
++        let hasTransformer = model == .klein9B && quantization.transformer == .int4
++            ? Klein9BMLXInt4Model.isAvailable
++            : Flux2ModelDownloader.isDownloaded(.transformer(transformerVariant))
+ 
+         // Text encoder is handled by MistralCore/FluxTextEncoders, skip check here
+ 
+@@ -2566,7 +2588,8 @@ extension Flux2Pipeline {
+ 
+         // Use the appropriate transformer variant for this model type
+         let transformerVariant = ModelRegistry.TransformerVariant.variant(for: model, quantization: quantization.transformer)
+-        if !Flux2ModelDownloader.isDownloaded(.transformer(transformerVariant)) {
++        if !(model == .klein9B && quantization.transformer == .int4)
++            && !Flux2ModelDownloader.isDownloaded(.transformer(transformerVariant)) {
+             missing.append(.transformer(transformerVariant))
+         }
+ 

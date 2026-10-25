@@ -1,50 +1,95 @@
-name: build
+name: Build Typhoonminigen 9B Int4 (no models)
 
 on:
-  push:
-    branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Package.swift'
+      - 'Sources/**'
+      - 'tools/**'
+      - 'ci/**'
+      - '.github/workflows/build.yml'
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: macOS build (xcodebuild + Metal)
-    runs-on: macos-15
-    timeout-minutes: 90
+  build-macos-app:
+    name: Build macOS App · ARM64 · Xcode 26
+    runs-on: macos-26
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out modified app sources
+        uses: actions/checkout@v4
 
-      # Package.swift pins the engine as a local sibling checkout (../flux-2-swift-mlx-patched):
-      # upstream v2.4.0 + the vendored patches (RoPE-cache fix, DOP caption fix). Temporary
-      # until upstream ships them. Patches apply in filename order — keep the 000N- prefixes.
-      - name: Set up engine fork (upstream v2.4.0 + vendored patches)
+      - name: Prepare patched Swift MLX engine (no model weights)
+        shell: bash
         run: |
-          git clone --branch v2.4.0 --depth 1 https://github.com/VincentGourbin/flux-2-swift-mlx.git "$GITHUB_WORKSPACE/../flux-2-swift-mlx-patched"
-          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
-            echo "Applying $(basename "$p")"
-            git -C "$GITHUB_WORKSPACE/../flux-2-swift-mlx-patched" apply "$p"
-          done
+          set -euo pipefail
+          ENGINE="$GITHUB_WORKSPACE/../flux-2-swift-mlx-patched"
+          git clone --depth 1 --filter=blob:none --sparse --branch v3.1.0 \
+            https://github.com/VincentGourbin/flux-2-swift-mlx.git "$ENGINE"
+          git -C "$ENGINE" sparse-checkout set Sources
+          # Fail immediately if upstream no longer matches the reviewed patch.
+          git -C "$ENGINE" apply --check "$GITHUB_WORKSPACE/ci/engine/flux2-3.1.0-int4.patch"
+          git -C "$ENGINE" apply "$GITHUB_WORKSPACE/ci/engine/flux2-3.1.0-int4.patch"
+          cp "$GITHUB_WORKSPACE/ci/engine/Klein9BMLXInt4Model.swift" \
+            "$ENGINE/Sources/Flux2Core/Loading/Klein9BMLXInt4Model.swift"
+          test -s "$ENGINE/Sources/Flux2Core/Loading/Klein9BMLXInt4Model.swift"
 
-      - name: Select newest Xcode
+      - name: Select Xcode 26 toolchain
+        shell: bash
         run: |
-          latest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
-          echo "Selecting $latest"
-          sudo xcode-select -s "$latest/Contents/Developer"
+          set -euo pipefail
+          # macos-26 is GitHub's standard ARM64 runner, not a paid large runner.
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
           xcodebuild -version
+          swift --version
 
-      - name: Download Metal Toolchain (Xcode 26+)
-        run: xcodebuild -downloadComponent MetalToolchain || echo "::warning::MetalToolchain download returned non-zero (may already be present)"
-
-      - name: Resolve Swift packages
-        run: xcodebuild -resolvePackageDependencies -scheme Typhoonminigen
-
-      - name: Build
+      - name: Ensure Metal Toolchain is installed
+        shell: bash
         run: |
-          set -o pipefail
-          xcodebuild -scheme Typhoonminigen -destination 'platform=macOS' -derivedDataPath .build-ci -skipMacroValidation -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO build
+          set -euo pipefail
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun --find metal
+
+      - name: Check package configuration and Mistral safeguards
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift package dump-package >/dev/null
+          bash tools/check_mistral_fuses.sh
+
+      - name: Build and sign independent App
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The original lockfile records MLX 0.30.6 from upstream v2.4.
+          # The pinned new engine requires MLX 0.31.6: resolve on the runner.
+          rm -f Package.resolved
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          bash tools/bundle_app.sh Release \
+            "$GITHUB_WORKSPACE/dist/Typhoonminigen-9B-Int4.app"
+
+      - name: Verify App bundle and package it
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$GITHUB_WORKSPACE/dist/Typhoonminigen-9B-Int4.app"
+          test -s "$APP/Contents/MacOS/Typhoonminigen"
+          test -f "$APP/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" \
+            "$GITHUB_WORKSPACE/dist/Typhoonminigen-9B-Int4-macOS15-arm64.zip"
+          ls -lh "$GITHUB_WORKSPACE/dist/"*.zip
+
+      - name: Upload App (no model files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Typhoonminigen-9B-Int4-macOS15-arm64
+          path: dist/Typhoonminigen-9B-Int4-macOS15-arm64.zip
+          if-no-files-found: error
+          retention-days: 14

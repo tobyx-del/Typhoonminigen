@@ -203,11 +203,11 @@ struct GenerateView: View {
                 .font(.fx(11.5)).foregroundStyle(Color.fxText3)
                 .fixedSize(horizontal: false, vertical: true).lineSpacing(2)
             if vm.tier == .klein9B && vm.ramGB < 24 {
-                Text("Klein 9B peaks at ~19–20 GB — on this \(vm.ramGB) GB Mac it WILL swap and may freeze the system. Use Klein 4B here.")
+                Text("Klein 9B uses experimental MLX Int4 on this \(vm.ramGB) GB Mac. Memory pressure may still cause slowdowns or failure.")
                     .font(.fx(11, weight: .semibold)).foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             } else if vm.tier == .klein9B && vm.ramGB < 32 {
-                Text("Klein 9B is tight on a \(vm.ramGB) GB Mac (~19–20 GB peak + macOS) — it runs, but expect slowdowns. Klein 4B is the smooth choice.")
+                Text("Klein 9B uses MLX Int4. Klein 4B remains the faster daily option.")
                     .font(.fx(11)).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             } else if vm.tier == .klein4B && vm.ramGB < 16 {
@@ -225,7 +225,7 @@ struct GenerateView: View {
         case .klein4B:
             return "Klein 4B: light tier — ~4 GB download + ~4 GB encoder, no token, Apache 2.0. Made for 16–24 GB Macs; ~1 min per 1024² image, somewhat simpler detail."
         case .klein9B:
-            return "Klein 9B: quality tier — ~19 GB peak (fits 32 GB without swap), gated — needs an HF token in the Models tab."
+            return "Klein 9B: experimental MLX Int4 transformer + Qwen3-8B 4-bit encoder. Download only the quantized weights."
         }
     }
 
@@ -238,16 +238,7 @@ struct GenerateView: View {
     /// re-evaluates on every telemetry tick / keystroke.
     private var nineBEncoderNote: String? {
         guard vm.tier == .klein9B else { return nil }
-        switch (vm.nineBEncoder8BitOnDisk, vm.nineBEncoder4BitOnDisk) {
-        case (true, true):
-            return "Both 9B rungs run the same Full bf16 image model — they differ only in the text encoder. Both Qwen3-8B encoders are on disk and the engine prefers 8-bit, so Standard and Best currently render identically."
-        case (true, false):
-            return "9B loads the 8-bit text encoder (on disk). The Standard/Best rung only changes the encoder precision — the bf16 image model is identical either way."
-        case (false, true):
-            return "9B loads the 4-bit text encoder (on disk). The Standard/Best rung only changes the encoder precision — the bf16 image model is identical either way."
-        case (false, false):
-            return nil
-        }
+        return "Klein 9B has one native MLX Int4 quality level. The 9B Base training weights are separate."
     }
 
     /// Tier selector chip. Disabled while generating: queued items keep their snapshotted
